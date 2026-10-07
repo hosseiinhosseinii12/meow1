@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en" class="no-js" data-root="../">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Sign in | Atelier Admin | Maison Verdant</title>
+  <meta name="description" content="Staff sign in.">
+  <meta name="robots" content="noindex, nofollow">
+  <link rel="canonical" href="https://maisonverdant.com/admin/login.html">
+  <meta name="theme-color" content="#FBF9F5">
+  <meta name="color-scheme" content="light dark">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Maison Verdant">
+  <meta property="og:title" content="Sign in | Atelier Admin | Maison Verdant">
+  <meta property="og:description" content="Staff sign in.">
+  <meta property="og:url" content="https://maisonverdant.com/admin/login.html">
+  <meta property="og:image" content="https://maisonverdant.com/assets/og-image.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:site" content="@maisonverdant">
+  <meta name="twitter:title" content="Sign in | Atelier Admin | Maison Verdant">
+  <meta name="twitter:description" content="Staff sign in.">
+  <meta name="twitter:image" content="https://maisonverdant.com/assets/og-image.jpg">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="../assets/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://images.unsplash.com" crossorigin>
+  <link rel="dns-prefetch" href="https://images.unsplash.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300;1,400&family=Manrope:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../css/tokens.css">
+  <link rel="stylesheet" href="../css/reset.css">
+  <link rel="stylesheet" href="../css/base.css">
+  <link rel="stylesheet" href="../css/layout.css">
+  <link rel="stylesheet" href="../css/components.css">
+  <link rel="stylesheet" href="../css/pages.css">
+  <link rel="stylesheet" href="../css/animations.css">
+  <link rel="stylesheet" href="../css/utilities.css">
+  <link rel="stylesheet" href="../css/admin.css">
+  <link rel="modulepreload" href="../js/admin.js">
+  <script>(function(){try{var t=JSON.parse(localStorage.getItem('mv:v1:theme'));if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}catch(e){}})();</script>
+  <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Organization", "name": "Maison Verdant", "url": "https://maisonverdant.com", "logo": "https://maisonverdant.com/assets/logo.svg", "sameAs": ["https://instagram.com/maisonverdant", "https://pinterest.com/maisonverdant"], "contactPoint": {"@type": "ContactPoint", "telephone": "+44-20-7946-0321", "contactType": "customer service", "availableLanguage": ["English", "French", "Italian"]}, "address": {"@type": "PostalAddress", "streetAddress": "24 Marylebone High Street", "addressLocality": "London", "postalCode": "W1U 4NR", "addressCountry": "GB"}}</script>
+</head>
+<body data-page="admin-login">
+<main class="admin-login" id="main">
+  <div class="admin-login__card load-in">
+    <div class="u-center"><a class="wordmark" href="../index.html" style="font-size:1.35rem">Verdant<small>Atelier</small></a></div>
+    <div class="u-center"><h1 class="u-3xl">Staff sign in</h1><p class="u-soft u-sm u-mt-2">For members of the Maison Verdant team.</p></div>
+    <form id="admin-login-form" class="form-grid" data-validate>
+      <div class="field"><label class="field__label" for="al-email">Email</label><input class="field__control" id="al-email" name="email" type="email" autocomplete="username" required value="charlotte@maisonverdant.com"></div>
+      <div class="field"><label class="field__label" for="al-pass">Password</label><div class="field__wrap"><input class="field__control" id="al-pass" name="password" type="password" autocomplete="current-password" required minlength="8"><button class="field__toggle" type="button" data-toggle-password aria-label="Show password" aria-pressed="false"><svg class="icon " viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
+      <label class="check"><input type="checkbox" checked> Keep me signed in on this device</label>
+      <button class="btn btn--block" type="submit">Sign in</button>
+    </form>
+    <p class="u-xs u-muted u-center">Demo access: any password of eight or more characters.</p>
+  </div>
+</main>
+<div class="toast-region" aria-live="polite" role="status"></div>
+<script type="module" src="../js/admin.js"></script>
+</body>
+</html>

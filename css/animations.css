@@ -1,0 +1,60 @@
+/* ==========================================================================
+   Animations — keyframes, reveal system, scroll-driven effects.
+   All motion is suppressed under prefers-reduced-motion (see reset + tokens).
+   ========================================================================== */
+@layer animations {
+  @keyframes kenburns { from { transform: scale(1.02) translate3d(0,0,0); } to { transform: scale(1.14) translate3d(-1.5%, -1%, 0); } }
+  @keyframes slowzoom { from { transform: scale(1.12); } to { transform: scale(1); } }
+  @keyframes fade-up { from { opacity: 0; transform: translateY(24px); } to { opacity: 1; transform: none; } }
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -200% 0; } }
+  @keyframes ripple { to { transform: scale(4); opacity: 0; } }
+  @keyframes bump { 0% { transform: scale(1); } 40% { transform: scale(1.35); } 100% { transform: scale(1); } }
+  @keyframes heart-pulse { 0% { transform: scale(1); } 30% { transform: scale(1.28); } 60% { transform: scale(0.94); } 100% { transform: scale(1); } }
+  @keyframes toast-in { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: none; } }
+  @keyframes toast-out { to { opacity: 0; transform: translateX(24px); } }
+  @keyframes toast-bar { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+  @keyframes draw { to { stroke-dashoffset: 0; } }
+  @keyframes scroll-cue { 0% { transform: scaleY(0); transform-origin: top; } 45% { transform: scaleY(1); transform-origin: top; } 55% { transform: scaleY(1); transform-origin: bottom; } 100% { transform: scaleY(0); transform-origin: bottom; } }
+  @keyframes collapse { to { opacity: 0; transform: translateX(-16px); } }
+  @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes tick { 0% { opacity: 0.4; transform: translateY(-4px); } 100% { opacity: 1; transform: none; } }
+
+  /* Scroll reveal (IntersectionObserver toggles .is-visible) */
+  .reveal { opacity: 0; transform: translateY(24px); transition: opacity var(--dur-lux) var(--ease-out), transform var(--dur-lux) var(--ease-out); transition-delay: calc(var(--i, 0) * 80ms); }
+  .reveal.is-visible { opacity: 1; transform: none; }
+  .no-js .reveal, .reveal-none .reveal { opacity: 1; transform: none; }
+
+  /* Page load stagger */
+  .load-in > * { animation: fade-up var(--dur-lux) var(--ease-out) both; }
+  .load-in > *:nth-child(1) { animation-delay: 80ms; }
+  .load-in > *:nth-child(2) { animation-delay: 180ms; }
+  .load-in > *:nth-child(3) { animation-delay: 280ms; }
+  .load-in > *:nth-child(4) { animation-delay: 380ms; }
+  .load-in > *:nth-child(5) { animation-delay: 480ms; }
+  .load-in > *:nth-child(6) { animation-delay: 580ms; }
+
+  .is-pulsing { animation: heart-pulse 700ms var(--ease-out); }
+  .num-tick { display: inline-block; animation: tick 300ms var(--ease-out); }
+
+  /* Blur-up images: tiny inline placeholder under the real image */
+  .blur-up { filter: blur(16px); transform: scale(1.04); transition: filter 700ms var(--ease-out), transform 700ms var(--ease-out); }
+  .blur-up.is-loaded { filter: none; transform: none; }
+
+  /* Scroll-driven progress line (supported browsers) */
+  @supports (animation-timeline: scroll()) {
+    .read-progress { position: fixed; inset-block-start: 0; inset-inline: 0; block-size: 2px; z-index: calc(var(--z-header) + 2); background: var(--color-gold); transform-origin: left; animation: grow-x linear both; animation-timeline: scroll(root); }
+    @keyframes grow-x { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+    .parallax-soft { animation: parallax linear both; animation-timeline: view(); animation-range: entry 0% exit 100%; }
+    @keyframes parallax { from { transform: translateY(-4%) scale(1.08); } to { transform: translateY(4%) scale(1.08); } }
+  }
+  @supports not (animation-timeline: scroll()) { .read-progress { display: none; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { opacity: 1; transform: none; }
+    .load-in > * { animation: none; }
+    .parallax-soft, .read-progress { animation: none; }
+    .blur-up { filter: none; transform: none; }
+  }
+}
