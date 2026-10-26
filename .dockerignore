@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+data/
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm
+.git/
+.gitignore
+setup.ps1
+README.md
