@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-SELF BOT — QR login + MiaoBet (Meowie bet) bowling auto-bettor + Meow farmer.
+SELF BOT — QR/phone login + MiaoBet (Meowie bet) bowling auto-bettor + Meow farmer
++ Halloween Miyoui shop farmer (multi-user).
 
 Usage:
   python app.py                 # run the bot
@@ -8,13 +9,15 @@ Usage:
   python app.py --reset         # wipe the database
 
 In a Telegram group, send from your own account:
-  .activegroupsbet   register + activate the group for bowling bets
-  .activemeow        start the auto-meow loop in this group
-  .stopmeow          stop the auto-meow loop
+  .activegroupsbet   register + activate the group for bowling bets   (owner only)
+  .activemeow        start the auto-meow loop in this group           (owner only)
+  .stopmeow          stop the auto-meow loop                          (owner only)
+  .activehalloween   start the Halloween shop loop in this group      (every logged-in user)
+  .stophalloween     stop the Halloween shop loop                     (every logged-in user)
 
 Login: QR code, or phone number (code typed by hand OR a safe-style keypad).
 
-Then open the control bot -> MiaoBet.
+Then open the control bot -> MiaoBet / Halloween.
 """
 from __future__ import annotations
 
@@ -54,6 +57,7 @@ try:
     import telethon.errors as tg_errors
     from telethon import Button, TelegramClient, events
     from telethon.errors import FloodWaitError, MessageNotModifiedError, SessionPasswordNeededError
+    from telethon.sessions import StringSession
     from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
     from telethon.tl.types import InputMediaDice, MessageMediaDice
 except ImportError:
@@ -132,6 +136,8 @@ BTN_CHOICE = "miobet_choice_{}"        # panel 3: odd | even
 GROUP_CMD = r"^\.activegroupsbet$"     # sent inside a group to activate it
 MEOW_ON_CMD = r"^\.activemeow$"        # sent inside a group to start meowing
 MEOW_OFF_CMD = r"^\.stopmeow$"         # sent inside a group to stop meowing
+HAL_ON_CMD = r"^\.activehalloween$"    # sent inside a group to start the Halloween loop
+HAL_OFF_CMD = r"^\.stophalloween$"     # sent inside a group to stop it
 
 
 def _env_str(key: str, default: str = "") -> str:
@@ -158,8 +164,6 @@ def _env_bool(key: str, default: bool) -> bool:
     if raw in ("0", "false", "no", "off", "n", "f", "disable", "disabled"):
         return False
     guess = raw[0] in "ty1"          # 'ture', 'treu', 'yse' ...
-    if raw[0] in "tyf10n" and raw[:2] != "of" or raw.startswith("off"):
-        guess = raw[0] in "ty1"
     print(f"WARNING: {key}={raw!r} is not a valid boolean — treating it as {guess}. "
           f"Use true/false.", file=sys.stderr)
     return guess
@@ -170,7 +174,7 @@ CONFIG: Dict[str, Any] = {
     "api_hash": _env_str("API_HASH", PUBLIC_API_HASH),
     "bot_token": _env_str("BOT_TOKEN", ""),
     "owner_id": _env_int("OWNER_ID", 0),
-    # True  = every user who sends /start may use the bot panel
+    # True  = every user who sends /start may use the bot panel (own account + Halloween)
     # False = only owner_id (the first person who logs in) may use it
     "allow_all_users": _env_bool("ALLOW_ALL_USERS", True),
     "use_proxy": _env_bool("USE_PROXY", True),
@@ -206,6 +210,8 @@ CONFIG: Dict[str, Any] = {
     "slot_throws": 0,
     "slot_matches": 0,
     "slot_wins": 0,
+    # Halloween Miyoui — per-user settings: {"<uid>": {...}}
+    "hal": {},
 }
 
 CONFIG_FILE = DB_DIR / "config.json"
@@ -294,6 +300,7 @@ log = get_log("main")
 log_bot = get_log("bot")
 log_bet = get_log("bet")
 log_meow = get_log("meow")
+log_hal = get_log("halloween")
 
 console = Console() if RICH else None
 
@@ -772,6 +779,8 @@ def parse_meow(text: Optional[str]) -> Optional[dict]:
 class Runtime:
     def __init__(self):
         self.bot: Optional[TelegramClient] = None
+        # RT.user = the OWNER's authorized account (used by MiaoBet / Meow / Captcha / Slot).
+        # Every logged-in account (owner included) also lives in ACCOUNTS.
         self.user: Optional[TelegramClient] = None
         self.stop_evt: Optional[asyncio.Event] = None   # created inside the running loop
         self.qr_wait_tasks: Dict[int, asyncio.Task] = {}
@@ -780,9 +789,6 @@ class Runtime:
         self.engine: Optional["BetEngine"] = None
         self.meow: Optional["MeowEngine"] = None
         self.watchdog: Optional[asyncio.Task] = None
-        # a client that is connected but NOT authorized yet (QR / phone login in progress).
-        # RT.user is only set once the login really succeeded.
-        self.login_client: Optional[TelegramClient] = None
         self.phone_flow: Dict[int, dict] = {}
         self.twofa_tries: Dict[int, int] = {}
 
@@ -857,10 +863,53 @@ _CONN_KW = dict(
 )
 
 
-def _make_user_client() -> TelegramClient:
+# --- per-user sessions (StringSession: one text file per user, no SQLite lock) ---
+SESS_DIR = DB_DIR / "sessions"
+SESS_DIR.mkdir(exist_ok=True)
+ACCOUNTS: Dict[int, TelegramClient] = {}   # uid -> authorized client
+PENDING: Dict[int, TelegramClient] = {}    # uid -> client in the middle of login
+
+
+def load_session_str(uid: int) -> str:
+    p = SESS_DIR / f"{uid}.txt"
+    try:
+        return p.read_text(encoding="utf-8").strip() if p.exists() else ""
+    except Exception:
+        return ""
+
+
+def save_session(uid: int, client: TelegramClient) -> None:
+    try:
+        p = SESS_DIR / f"{uid}.txt"
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(StringSession.save(client.session), encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp, p)
+    except Exception as e:
+        record_error("save_session", e)
+
+
+def drop_session(uid: int) -> None:
+    try:
+        (SESS_DIR / f"{uid}.txt").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def uid_of(client) -> Optional[int]:
+    for u, c in ACCOUNTS.items():
+        if c is client:
+            return u
+    return None
+
+
+def _make_user_client(uid: int) -> TelegramClient:
     api_id, api_hash = _api_creds()
     return TelegramClient(
-        str(DB_DIR / "user.session"),
+        StringSession(load_session_str(uid)),
         api_id,
         api_hash,
         proxy=_proxy_tuple(),
@@ -884,11 +933,44 @@ def _make_bot_client() -> TelegramClient:
     )
 
 
+async def migrate_old_session() -> None:
+    """user.session (sqlite) -> sessions/<owner>.txt, once."""
+    old_f = DB_DIR / "user.session"
+    if not old_f.exists() or list(SESS_DIR.glob("*.txt")):
+        return
+    api_id, api_hash = _api_creds()
+    old = TelegramClient(str(old_f), api_id, api_hash, proxy=_proxy_tuple())
+    try:
+        await old.connect()
+        if await old.is_user_authorized():
+            me = await old.get_me()
+            target = owner_id() or me.id
+            ss = StringSession()
+            ss.set_dc(old.session.dc_id, old.session.server_address, old.session.port)
+            ss.auth_key = old.session.auth_key
+            (SESS_DIR / f"{target}.txt").write_text(ss.save(), encoding="utf-8")
+            if not CONFIG["owner_id"]:
+                CONFIG["owner_id"] = target
+                save_config()
+            log.info(f"old user.session migrated -> sessions/{target}.txt")
+    except Exception as e:
+        record_error("migrate-session", e)
+    finally:
+        try:
+            await old.disconnect()
+        except Exception:
+            pass
+    try:
+        old_f.replace(old_f.with_suffix(".migrated"))
+    except Exception:
+        pass
+
+
 # ===========================================================================
 # 6. MIAOBET ENGINE
 # ===========================================================================
 class BetEngine:
-    """Martingale bowling bettor driven by the user account (RT.user)."""
+    """Martingale bowling bettor driven by the owner's account (RT.user)."""
 
     def __init__(self):
         self.task: Optional[asyncio.Task] = None
@@ -1419,6 +1501,8 @@ def slot_is_start(text: Optional[str]) -> bool:
     return ("چالش اسلات" in t
             or ("اسلات" in t and "کامنت" in t)
             or ("کازینو" in t and "کامنت" in t))
+
+
 _slot_task: Optional[asyncio.Task] = None
 
 
@@ -1670,20 +1754,461 @@ async def _on_game_msg(event) -> None:
     eng.feed(event.message)
 
 
+# ===========================================================================
+# 7b. HALLOWEEN MIYOUI (per-user, every logged-in account)
+# ===========================================================================
+HAL_DEFAULT: Dict[str, Any] = {
+    "on": False, "chat": 0, "title": "", "trigger": "هالووین میویی", "extra": 2.0,
+    "runs": 0, "gifts": 0, "elixirs": 0, "failed": 0, "last_candy": None, "last": "",
+}
+HAL_FAIL_WORDS = ("کافی نیست", "آبنبات کافی", "نداری", "ناموفق", "موجود نیست")
+HAL_OK_WORDS = ("خریدی", "خرید شد", "خرید موفق", "با موفقیت", "خریداری")
+
+
+def hcfg(uid: int) -> dict:
+    d = CONFIG.setdefault("hal", {}).setdefault(str(uid), {})
+    for k, v in HAL_DEFAULT.items():
+        d.setdefault(k, v)
+    return d
+
+
+def parse_hal_timer(text: Optional[str]) -> Optional[int]:
+    """'شارژ مجدد تا : 24 دقیقه 10 ثانیه'  or  'شارژ مجدد تا : 01:24:10'."""
+    t = clean(text).replace("`", "")
+    m = re.search(r"شارژ\s*مجدد\s*تا\s*:?\s*([^\n]+)", t)
+    if not m:
+        return None
+    seg = m.group(1)
+    c = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)", seg)
+    if c:
+        a, b, s = c.groups()
+        return int(a) * 3600 + int(b) * 60 + int(s) if s is not None else int(a) * 60 + int(b)
+    units = {"ساعت": 3600, "دقیقه": 60, "ثانیه": 1}
+    found = re.findall(r"(\d+)\s*(ساعت|دقیقه|ثانیه)", seg)
+    return sum(int(n) * units[u] for n, u in found) if found else None
+
+
+def parse_candy(text: Optional[str]) -> Optional[int]:
+    m = re.search(r"آبنبات\s*هات\s*:?\s*(\d+)", clean(text).replace("`", ""))
+    return int(m.group(1)) if m else None
+
+
+_HAL_ITEM_RE = re.compile(r"(?m)^\W*(\d+)\s*[─—\-–]\s*(.+?)\s*[·•]")
+
+
+def parse_hal_items(text: Optional[str]) -> List[dict]:
+    t = clean(text).replace("`", "")
+    ms = list(_HAL_ITEM_RE.finditer(t))
+    out = []
+    for i, m in enumerate(ms):
+        seg = t[m.end(): ms[i + 1].start() if i + 1 < len(ms) else len(t)]
+        sold = "تموم شد" in seg
+        out.append({"n": int(m.group(1)), "name": m.group(2).strip(),
+                    "avail": ("موجود" in seg) and not sold})
+    return out
+
+
+def btn_by_text(msg, sub: str) -> Optional[bytes]:
+    """Callback data of the first inline button whose label contains `sub`."""
+    rm = getattr(msg, "reply_markup", None)
+    for row in getattr(rm, "rows", None) or []:
+        for b in getattr(row, "buttons", None) or []:
+            d = getattr(b, "data", None)
+            if d and sub in clean(getattr(b, "text", "")):
+                return d
+    return None
+
+
+def _is_shop(m) -> bool:
+    t = clean(m.raw_text)
+    return "فروشگاه هالووین" in t and "شارژ مجدد" in t
+
+
+class HalEngine:
+    GIFT_KW = "گیفت"
+    ELIXIR_KW = ("آسیب", "اکسیر")
+
+    def __init__(self, uid: int):
+        self.uid = uid
+        self.task: Optional[asyncio.Task] = None
+        self.waiters: List[Tuple[Any, asyncio.Future]] = []
+        self.recent: "collections.deque" = collections.deque(maxlen=30)
+        self.state = "stopped"
+        self.next_at: Optional[float] = None
+
+    @property
+    def cfg(self) -> dict:
+        return hcfg(self.uid)
+
+    @property
+    def client(self) -> Optional[TelegramClient]:
+        return ACCOUNTS.get(self.uid)
+
+    @property
+    def running(self) -> bool:
+        return self.task is not None and not self.task.done()
+
+    def start(self) -> Optional[str]:
+        if self.running:
+            return "Already running."
+        if self.client is None:
+            return "Log in first."
+        if not self.cfg["chat"]:
+            return "No group. Send .activehalloween inside a group."
+        self.recent.clear()
+        self.task = spawn(self._loop(), f"hal-loop-{self.uid}")
+        return None
+
+    def stop(self) -> None:
+        if self.task and not self.task.done():
+            self.task.cancel()
+        for _, f in self.waiters:
+            if not f.done():
+                f.cancel()
+        self.waiters.clear()
+        self.state, self.next_at = "stopped", None
+
+    # --- waiters -----------------------------------------------------------
+    def feed(self, msg) -> None:
+        self.recent.append((time.time(), msg))
+        for item in list(self.waiters):
+            pred, fut = item
+            if fut.done():
+                self.waiters.remove(item)
+                continue
+            try:
+                ok = pred(msg)
+            except Exception:
+                ok = False
+            if ok:
+                self.waiters.remove(item)
+                fut.set_result(msg)
+
+    def expect(self, pred) -> asyncio.Future:
+        fut = asyncio.get_running_loop().create_future()
+        self.waiters.append((pred, fut))
+        return fut
+
+    async def wait(self, fut, timeout: float):
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            self.waiters = [w for w in self.waiters if w[1] is not fut]
+            return None
+
+    async def tell(self, text: str) -> None:
+        try:
+            await RT.bot.send_message(self.uid, text, parse_mode="md")
+        except Exception:
+            pass
+
+    async def _click(self, msg, data: bytes) -> str:
+        """Press an inline button; returns the toast text the bot answered with (may be '')."""
+        client = self.client
+        if client is None:
+            raise RuntimeError("logged out")
+        peer = await client.get_input_entity(int(self.cfg["chat"]))
+        try:
+            res = await client(GetBotCallbackAnswerRequest(peer=peer, msg_id=msg.id, data=data))
+            return getattr(res, "message", "") or ""
+        except WAIT_ERRORS:
+            raise
+        except Exception as e:
+            if "BotResponseTimeout" in type(e).__name__:
+                return ""
+            raise
+
+    # --- choose + buy + verify ---------------------------------------------
+    def _choose(self, items, panel):
+        """Gift box first; otherwise the damage elixir. Only items that are in stock."""
+        order = [("gift", self.GIFT_KW)] + [("elixir", k) for k in self.ELIXIR_KW]
+        for kind, kw in order:
+            it = next((i for i in items if kw in i["name"] and i["avail"]), None)
+            if it and btn_by_text(panel, kw):
+                return kind, it, kw
+        return None, None, None
+
+    async def _verify(self, item, mark, toast, candy_before):
+        """Purchase counts only if we see proof: candy dropped / item sold out / success text."""
+        deadline = time.time() + 8
+        while True:
+            other = [clean(toast)]
+            newpanel = None
+            for ts, m in list(self.recent):
+                if ts < mark:
+                    continue
+                if _is_shop(m):
+                    newpanel = m
+                else:
+                    other.append(clean(m.raw_text))
+            blob = " ".join(other)
+            if any(w in blob for w in HAL_FAIL_WORDS):
+                return False, "refused: " + blob.strip()[:80], newpanel
+            if newpanel is not None:
+                t = clean(newpanel.raw_text)
+                after = parse_candy(t)
+                if candy_before is not None and after is not None and after < candy_before:
+                    return True, "candy decreased", newpanel
+                it = next((i for i in parse_hal_items(t) if i["n"] == item["n"]), None)
+                if it is not None and item["avail"] and not it["avail"]:
+                    return True, "item now sold out", newpanel
+            if any(w in blob for w in HAL_OK_WORDS):
+                return True, "success message", newpanel
+            if time.time() >= deadline:
+                return False, "no confirmation", newpanel
+            await asyncio.sleep(0.5)
+
+    async def _buy(self, panel, kind, kw, item, candy_before):
+        for _ in (1, 2):
+            data = btn_by_text(panel, kw)
+            if data is None:
+                return False, "button vanished"
+            self.state = f"buying {kind}"
+            mark = time.time()
+            toast = await self._click(panel, data)
+            ok, why, newpanel = await self._verify(item, mark, toast, candy_before)
+            if ok:
+                return True, why
+            if why.startswith("refused"):
+                return False, why
+            if newpanel is not None:
+                panel = newpanel
+            await asyncio.sleep(1)
+        return False, "no confirmation"
+
+    # --- one round ---------------------------------------------------------
+    async def run_round(self):
+        client, c = self.client, self.cfg
+        if client is None:
+            return "stop", "Logged out.", None
+        chat = int(c["chat"])
+        t0 = datetime.now(timezone.utc) - timedelta(seconds=20)
+
+        def fresh(m):
+            return (m.edit_date or m.date) >= t0
+
+        # 1) send the trigger text -> main panel
+        self.state = "opening panel"
+        f1 = self.expect(lambda m: fresh(m) and btn_by_text(m, "فروشگاه") is not None)
+        await tg_call(lambda: client.send_message(chat, c["trigger"]), "hal trigger")
+        m1 = await self.wait(f1, 25)
+        if not m1:
+            return "fail", "no panel after the trigger text", None
+
+        # 2) open the shop -> read the recharge timer
+        self.state = "opening shop"
+        f2 = self.expect(lambda m: fresh(m) and _is_shop(m))
+        await asyncio.sleep(0.8)
+        await self._click(m1, btn_by_text(m1, "فروشگاه"))
+        shop = await self.wait(f2, 15)
+        if not shop:
+            return "fail", "shop panel never appeared", None
+        read_at = time.time()
+
+        secs = parse_hal_timer(shop.raw_text)
+        items = parse_hal_items(shop.raw_text)
+        candy = parse_candy(shop.raw_text)
+        c["runs"] = int(c["runs"]) + 1
+        c["last_candy"] = candy
+
+        # 3) buy gift box (priority) or elixir, verified
+        kind, item, kw = self._choose(items, shop)
+        if kind:
+            ok, why = await self._buy(shop, kind, kw, item, candy)
+            if ok:
+                key = "gifts" if kind == "gift" else "elixirs"
+                c[key] = int(c[key]) + 1
+                c["last"] = f"{kind} ✓ ({why})"
+                if kind == "gift":
+                    await self.tell("🎁 **Gift box bought** ✅ (verified: " + why + ")")
+            else:
+                c["failed"] = int(c["failed"]) + 1
+                c["last"] = f"{kind} ✗ ({why})"
+                await self.tell(f"⚠️ **Halloween:** couldn't confirm the {kind} purchase — `{why}`")
+        else:
+            c["last"] = "nothing to buy"
+        save_config()
+        log_hal.info(f"[{self.uid}] run={c['runs']} timer={secs} candy={candy} last={c['last']}")
+
+        if secs is None:
+            return "fail", "couldn't read the shop timer", None
+        extra = max(float(c.get("extra") or 2.0), 0.0)
+        return "ok", c["last"], max(read_at + secs + extra - time.time(), 5.0)
+
+    async def _loop(self) -> None:
+        fails = 0
+        try:
+            while True:
+                wait: float = 60
+                try:
+                    status, info, nxt = await self.run_round()
+                except asyncio.CancelledError:
+                    raise
+                except FATAL_SEND_ERRORS as e:
+                    record_error("halloween", e)
+                    await self.tell(f"⏹ **Halloween stopped**\n`{_short(e, 150).replace('`', chr(39))}`")
+                    self.cfg["on"] = False
+                    save_config()
+                    return
+                except Exception as e:
+                    record_error("halloween", e)
+                    status, info, nxt = "fail", _short(e, 200), None
+                if status == "stop":
+                    await self.tell(f"⏹ **Halloween stopped**\n{info}")
+                    return
+                if status == "fail":
+                    fails += 1
+                    log_hal.warning(f"[{self.uid}] failed ({fails}/4): {info}")
+                    if fails >= 4:
+                        await self.tell(f"⏹ **Halloween stopped** after 4 failures.\n`{info.replace('`', chr(39))}`")
+                        self.cfg["on"] = False
+                        save_config()
+                        return
+                    wait = min(30 * fails, 180)
+                else:
+                    fails, wait = 0, nxt or 60
+                self.state = f"waiting {fmt_mmss(wait)}"
+                self.next_at = time.time() + wait
+                await asyncio.sleep(wait)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.state, self.next_at = "stopped", None
+
+
+HAL: Dict[int, HalEngine] = {}
+
+
+def hal_engine(uid: int) -> HalEngine:
+    e = HAL.get(uid)
+    if e is None:
+        e = HAL[uid] = HalEngine(uid)
+    return e
+
+
+@guard("hal-on")
+async def _on_halon(event) -> None:
+    if not event.is_group:
+        return
+    uid = uid_of(event.client)
+    if uid is None:
+        return
+    chat = await event.get_chat()
+    title = getattr(chat, "title", None) or str(event.chat_id)
+    c, e = hcfg(uid), hal_engine(uid)
+    if int(c["chat"] or 0) != int(event.chat_id):
+        e.stop()
+    c.update(chat=int(event.chat_id), title=title, on=True)
+    save_config()
+    err = e.start()
+    await _flash(event, f"🎃 Halloween active in: {title}" if not err else f"⚠️ {err}")
+
+
+@guard("hal-off")
+async def _on_haloff(event) -> None:
+    if not event.is_group:
+        return
+    uid = uid_of(event.client)
+    if uid is None:
+        return
+    hal_engine(uid).stop()
+    hcfg(uid)["on"] = False
+    save_config()
+    await _flash(event, "⏹ Halloween stopped.")
+
+
+@guard("hal-listener", notify=False)
+async def _on_hal_msg(event) -> None:
+    if not event.is_group:
+        return
+    uid = uid_of(event.client)
+    eng = HAL.get(uid) if uid is not None else None
+    if eng is None or not eng.running or event.chat_id != int(eng.cfg["chat"] or 0):
+        return
+    sender = await event.get_sender()
+    if not getattr(sender, "bot", False):
+        return
+    eng.feed(event.message)
+
+
+def hal_view(uid: int, note: str = "") -> Tuple[str, list]:
+    e, c = hal_engine(uid), hcfg(uid)
+    run = e.running
+    left = f" ({fmt_mmss(e.next_at - time.time())})" if run and e.next_at else ""
+    group = c["title"] or "— (send .activehalloween in a group)"
+    candy = c["last_candy"] if c["last_candy"] is not None else "—"
+    text = (
+        "**🎃 Halloween Miyoui**\n\n"
+        f"**Status:** {'▶️ Running' if run else '⏹ Stopped'} — {e.state}{left}\n"
+        f"**Group:** {group}\n"
+        f"**Trigger text:** `{c['trigger']}`\n"
+        f"**Extra wait after timer:** {float(c['extra']):g}s\n\n"
+        f"**Rounds:** {c['runs']}\n"
+        f"**🎁 Gift boxes bought:** {c['gifts']}\n"
+        f"**🧪 Elixirs bought:** {c['elixirs']}\n"
+        f"**⚠️ Unconfirmed:** {c['failed']}\n"
+        f"**🍬 Last candy:** {candy}\n"
+        f"**Last result:** {c['last'] or '—'}"
+    )
+    rows = [
+        [sbtn("⏹ Stop" if run else "▶️ Start", b"hal:stop" if run else b"hal:start",
+              "danger" if run else "success")],
+        [sbtn("✏️ Text", b"hal:set:trigger", "primary"), sbtn("⏱ Extra wait", b"hal:set:extra", "primary")],
+        [Button.inline("🔄 Refresh", b"hal:menu"), sbtn("🗑 Reset counters", b"hal:reset", "danger")],
+        [Button.inline("◀️ Back", b"nav:main")],
+    ]
+    return (f"{note}\n\n{text}" if note else text), rows
+
+
+def hal_apply_input(uid: int, key: str, raw: str) -> Tuple[bool, str]:
+    c = hcfg(uid)
+    if key == "hal_trigger":
+        v = (raw or "").strip()          # keep the text exactly as typed (no normalisation)
+        if not v or len(v) > 50:
+            return False, "Send 1–50 characters."
+        c["trigger"] = v
+        save_config()
+        return True, f"✅ Trigger text = {v}"
+    try:
+        v = float(clean(raw).strip().replace(",", "."))
+    except ValueError:
+        return False, "Send a number."
+    if not 0 <= v <= 30:
+        return False, "Send seconds between 0 and 30."
+    c["extra"] = v
+    save_config()
+    return True, f"✅ Extra wait = {v:g}s"
+
+
+def _only_main(fn):
+    """Legacy MiaoBet/Meow/Captcha/Slot handlers only react on the OWNER's account."""
+    @functools.wraps(fn)
+    async def w(event):
+        if event.client is RT.user:
+            return await fn(event)
+    return w
+
+
 def attach_user_handlers(client: TelegramClient) -> None:
     if getattr(client, "_bet_attached", False):
         return
     client._bet_attached = True
-    client.add_event_handler(_on_activate, events.NewMessage(outgoing=True, pattern=GROUP_CMD))
-    client.add_event_handler(_on_activemeow, events.NewMessage(outgoing=True, pattern=MEOW_ON_CMD))
-    client.add_event_handler(_on_stopmeow, events.NewMessage(outgoing=True, pattern=MEOW_OFF_CMD))
-    client.add_event_handler(_on_captcha, events.NewMessage(incoming=True))
-    client.add_event_handler(_on_slot_post, events.NewMessage(incoming=True))
-    client.add_event_handler(_on_slot_edit, events.MessageEdited(incoming=True))
-    client.add_event_handler(_on_game_msg, events.NewMessage(incoming=True))
-    client.add_event_handler(_on_game_msg, events.MessageEdited(incoming=True))
-    client.add_event_handler(_on_meow_msg, events.NewMessage(incoming=True))
-    client.add_event_handler(_on_meow_msg, events.MessageEdited(incoming=True))
+    A = client.add_event_handler
+    A(_only_main(_on_activate), events.NewMessage(outgoing=True, pattern=GROUP_CMD))
+    A(_only_main(_on_activemeow), events.NewMessage(outgoing=True, pattern=MEOW_ON_CMD))
+    A(_only_main(_on_stopmeow), events.NewMessage(outgoing=True, pattern=MEOW_OFF_CMD))
+    A(_only_main(_on_captcha), events.NewMessage(incoming=True))
+    A(_only_main(_on_slot_post), events.NewMessage(incoming=True))
+    A(_only_main(_on_slot_edit), events.MessageEdited(incoming=True))
+    A(_only_main(_on_game_msg), events.NewMessage(incoming=True))
+    A(_only_main(_on_game_msg), events.MessageEdited(incoming=True))
+    A(_only_main(_on_meow_msg), events.NewMessage(incoming=True))
+    A(_only_main(_on_meow_msg), events.MessageEdited(incoming=True))
+    # Halloween: every account
+    A(_on_halon, events.NewMessage(outgoing=True, pattern=HAL_ON_CMD))
+    A(_on_haloff, events.NewMessage(outgoing=True, pattern=HAL_OFF_CMD))
+    A(_on_hal_msg, events.NewMessage(incoming=True))
+    A(_on_hal_msg, events.MessageEdited(incoming=True))
     log_bet.info("user handlers attached")
 
 
@@ -1691,7 +2216,7 @@ def attach_user_handlers(client: TelegramClient) -> None:
 # 8. PANELS
 # ===========================================================================
 def main_text(uid: int) -> str:
-    logged = "✅" if RT.user else "❌"
+    logged = "✅" if uid in ACCOUNTS else "❌"
     u = db_get_user(uid) or {}
     name = u.get("first_name") or "—"
     phone = u.get("phone") or "—"
@@ -1703,13 +2228,15 @@ def main_text(uid: int) -> str:
     )
 
 
-def main_buttons():
+def main_buttons(uid: int):
     rows = []
-    if not RT.user:
+    if uid not in ACCOUNTS:
         rows.append([sbtn("📷 Login with QR", b"auth:qr", "success")])
         rows.append([sbtn("📱 Login with Phone", b"auth:phone", "success")])
     else:
-        rows.append([sbtn("🎳 MiaoBet", b"nav:bet", "primary")])
+        if uid == owner_id() and RT.user:
+            rows.append([sbtn("🎳 MiaoBet", b"nav:bet", "primary")])
+        rows.append([sbtn("🎃 Halloween", b"hal:menu", "primary")])
         rows.append([sbtn("🚪 Logout", b"auth:logout", "danger")])
     return rows
 
@@ -1727,7 +2254,7 @@ def qr_prompt_text() -> str:
 
 def login_success_text(first_name: str, phone: str) -> str:
     return (
-        f"✅ **Logged in via QR!**\n\n"
+        f"✅ **Logged in!**\n\n"
         f"👤 **{first_name}**\n"
         f"📞 `{phone or '—'}`"
     )
@@ -1736,7 +2263,7 @@ def login_success_text(first_name: str, phone: str) -> str:
 def qr_2fa_text() -> str:
     return (
         "**🔐 2FA Required**\n\n"
-        "QR was scanned, but your account has **two-step verification**.\n\n"
+        "Your account has **two-step verification**.\n\n"
         "Send your **2FA password** now.\n\n"
         "_Message will be deleted immediately._"
     )
@@ -2256,8 +2783,98 @@ async def _send_qr(uid: int, url: str):
 
 
 # ===========================================================================
-# 10. QR LOGIN FLOW
+# 10. LOGIN (QR + phone)
 # ===========================================================================
+async def get_login_client(uid: int) -> TelegramClient:
+    """Connected client for this user: the authorized one, or a pending one used for login."""
+    c = ACCOUNTS.get(uid) or PENDING.get(uid)
+    if c is None:
+        c = _make_user_client(uid)
+        PENDING[uid] = c
+    if not c.is_connected():
+        await c.connect()
+    attach_user_handlers(c)
+    return c
+
+
+def _register_account(uid: int, client: TelegramClient) -> None:
+    ACCOUNTS[uid] = client
+    PENDING.pop(uid, None)
+    save_session(uid, client)
+    if not CONFIG["owner_id"]:
+        CONFIG["owner_id"] = uid
+        save_config()
+    if uid == owner_id():
+        RT.user = client
+    attach_user_handlers(client)
+
+
+async def adopt_if_authorized(uid: int, client: TelegramClient, event=None) -> bool:
+    """If this client is already logged in, just use it (never get stuck on 'login')."""
+    try:
+        if not await client.is_user_authorized():
+            return False
+        me = await client.get_me()
+    except Exception as e:
+        log_bot.warning(f"is_user_authorized failed: {e}")
+        return False
+    _register_account(uid, client)
+    ensure_user(uid, username=me.username or "", first_name=me.first_name or "", phone=me.phone or "")
+    text = f"✅ Already logged in as **{me.first_name}**."
+    try:
+        if event is not None:
+            await event.respond(text, buttons=main_buttons(uid), parse_mode="md")
+        elif RT.bot:
+            await RT.bot.send_message(uid, text, buttons=main_buttons(uid), parse_mode="md")
+    except Exception:
+        pass
+    return True
+
+
+async def reset_login_state(uid: int) -> None:
+    """Forget every half-finished login step for this user (called on /start, cancel...)."""
+    RT.phone_flow.pop(uid, None)
+    RT.set_2fa(uid, False)
+    RT.twofa_tries.pop(uid, None)
+    RT.await_input.pop(uid, None)
+    t = RT.qr_wait_tasks.pop(uid, None)
+    if t and not t.done():
+        t.cancel()
+
+
+TWOFA_BUTTONS = [[Button.inline("✖️ Cancel", b"auth:cancel")]]
+
+
+async def _finish_login(uid: int) -> None:
+    """Common post-login steps (QR scan, phone code or 2FA)."""
+    client = PENDING.get(uid) or ACCOUNTS.get(uid)
+    if client is None:
+        raise RuntimeError("no client to finish login with")
+    me = await client.get_me()
+    RT.phone_flow.pop(uid, None)
+    RT.twofa_tries.pop(uid, None)
+    RT.set_2fa(uid, False)
+    ensure_user(
+        uid,
+        username=me.username or "",
+        first_name=me.first_name or "",
+        phone=me.phone or "",
+    )
+    # the person chatting with this bot is the owner if nobody claimed it yet
+    _register_account(uid, client)
+    await RT.bot.send_message(
+        uid,
+        login_success_text(me.first_name or "User", me.phone or ""),
+        buttons=main_buttons(uid),
+        parse_mode="md",
+    )
+    log_bot.info(f"user {uid} logged in as {me.first_name}")
+    if uid == owner_id() and CONFIG.get("meow_on") and CONFIG.get("meow_chat"):
+        RT.meow.start()
+    if hcfg(uid)["on"] and hcfg(uid)["chat"]:
+        hal_engine(uid).start()
+
+
 async def _handle_qr_login(event, uid: int) -> None:
     if not HAS_QRCODE:
         await event.respond(
@@ -2272,7 +2889,7 @@ async def _handle_qr_login(event, uid: int) -> None:
 
     RT.phone_flow.pop(uid, None)
     try:
-        client = await get_login_client()
+        client = await get_login_client(uid)
     except Exception as e:
         record_error("qr-client", e)
         await event.respond(f"❌ Client error: `{_short(e, 200).replace('`', chr(39))}`")
@@ -2299,94 +2916,6 @@ async def _handle_qr_login(event, uid: int) -> None:
         return
 
     RT.qr_wait_tasks[uid] = spawn(_qr_wait_task(uid, qr, first), f"qr-wait-{uid}")
-
-
-# --- login client helpers ----------------------------------------------------
-async def get_login_client() -> TelegramClient:
-    """Connected client used for QR/phone login. Authorized clients live in RT.user."""
-    if RT.user is not None:
-        return RT.user
-    c = RT.login_client
-    if c is None:
-        c = _make_user_client()
-        RT.login_client = c
-    if not c.is_connected():
-        await c.connect()
-    attach_user_handlers(c)
-    return c
-
-
-async def adopt_if_authorized(uid: int, client: TelegramClient, event=None) -> bool:
-    """If the session file is already logged in, just use it (never get stuck on 'login')."""
-    try:
-        if not await client.is_user_authorized():
-            return False
-        me = await client.get_me()
-    except Exception as e:
-        log_bot.warning(f"is_user_authorized failed: {e}")
-        return False
-    RT.user = client
-    if RT.login_client is client:
-        RT.login_client = None
-    ensure_user(uid, username=me.username or "", first_name=me.first_name or "", phone=me.phone or "")
-    attach_user_handlers(client)
-    text = f"✅ Already logged in as **{me.first_name}**."
-    try:
-        if event is not None:
-            await event.respond(text, buttons=main_buttons(), parse_mode="md")
-        elif RT.bot:
-            await RT.bot.send_message(uid, text, buttons=main_buttons(), parse_mode="md")
-    except Exception:
-        pass
-    return True
-
-
-async def reset_login_state(uid: int) -> None:
-    """Forget every half-finished login step for this user (called on /start, cancel...)."""
-    RT.phone_flow.pop(uid, None)
-    RT.set_2fa(uid, False)
-    RT.twofa_tries.pop(uid, None)
-    RT.await_input.pop(uid, None)
-    t = RT.qr_wait_tasks.pop(uid, None)
-    if t and not t.done():
-        t.cancel()
-
-
-TWOFA_BUTTONS = [[Button.inline("✖️ Cancel", b"auth:cancel")]]
-
-
-async def _finish_login(uid: int) -> None:
-    """Common post-login steps (QR scan, phone code or 2FA)."""
-    client = RT.login_client or RT.user
-    if client is None:
-        raise RuntimeError("no client to finish login with")
-    me = await client.get_me()
-    RT.user = client
-    if RT.login_client is client:
-        RT.login_client = None
-    RT.phone_flow.pop(uid, None)
-    RT.twofa_tries.pop(uid, None)
-    RT.set_2fa(uid, False)
-    ensure_user(
-        uid,
-        username=me.username or "",
-        first_name=me.first_name or "",
-        phone=me.phone or "",
-    )
-    # the person chatting with this bot is the owner (NOT necessarily the logged-in account)
-    if not CONFIG["owner_id"]:
-        CONFIG["owner_id"] = uid
-        save_config()
-    attach_user_handlers(client)
-    await RT.bot.send_message(
-        uid,
-        login_success_text(me.first_name or "User", me.phone or ""),
-        buttons=main_buttons(),
-        parse_mode="md",
-    )
-    log_bot.info(f"user {uid} logged in as {me.first_name}")
-    if CONFIG.get("meow_on") and CONFIG.get("meow_chat"):
-        RT.meow.start()
 
 
 # --- phone login --------------------------------------------------------------
@@ -2490,10 +3019,10 @@ async def phone_end(uid: int, text: str) -> None:
 async def phone_start(event, uid: int, edit) -> None:
     await reset_login_state(uid)
     try:
-        client = await get_login_client()
+        client = await get_login_client(uid)
     except Exception as e:
         record_error("phone-client", e)
-        await edit(event, f"❌ Client error: `{_short(e, 200).replace('`', chr(39))}`", main_buttons())
+        await edit(event, f"❌ Client error: `{_short(e, 200).replace('`', chr(39))}`", main_buttons(uid))
         return
     if await adopt_if_authorized(uid, client, event):
         return
@@ -2621,7 +3150,7 @@ async def phone_submit_code(uid: int, f: dict, event=None) -> None:
 async def route_phone_cb(event, data: str, uid: int, edit) -> None:
     f = flow_get(uid)
     if not f or f.get("step") != "code":
-        await edit(event, "⌛ This login attempt expired.\n\n" + main_text(uid), main_buttons())
+        await edit(event, "⌛ This login attempt expired.\n\n" + main_text(uid), main_buttons(uid))
         return
     if f.get("busy"):
         return
@@ -2734,37 +3263,32 @@ async def _qr_wait_task(uid: int, qr, last_msg) -> None:
 # 11. HANDLERS
 # ===========================================================================
 async def do_logout(uid: int) -> None:
-    RT.engine.stop()
-    RT.meow.stop()
-    slot_stop()
-    task = RT.qr_wait_tasks.pop(uid, None)
-    if task and not task.done():
-        task.cancel()
-    if RT.user:
+    hal_engine(uid).stop()
+    hcfg(uid)["on"] = False
+    save_config()
+    t = RT.qr_wait_tasks.pop(uid, None)
+    if t and not t.done():
+        t.cancel()
+    c = ACCOUNTS.pop(uid, None) or PENDING.pop(uid, None)
+    PENDING.pop(uid, None)
+    if c is not None and c is RT.user:
+        RT.engine.stop()
+        RT.meow.stop()
+        slot_stop()
+        RT.user = None
+    if c is not None:
         try:
-            await RT.user.log_out()
+            await c.log_out()
         except Exception:
             pass
         try:
-            await RT.user.disconnect()
+            await c.disconnect()
         except Exception:
             pass
-    RT.user = None
-    try:
-        f = DB_DIR / "user.session"
-        if f.exists():
-            f.unlink()
-    except Exception:
-        pass
+    drop_session(uid)
     RT.set_2fa(uid, False)
     RT.phone_flow.pop(uid, None)
     RT.twofa_tries.pop(uid, None)
-    lc, RT.login_client = RT.login_client, None
-    if lc is not None:
-        try:
-            await lc.disconnect()
-        except Exception:
-            pass
 
 
 def register_handlers(bot: TelegramClient) -> None:
@@ -2819,7 +3343,7 @@ def register_handlers(bot: TelegramClient) -> None:
             username=getattr(me, "username", "") or "",
             first_name=getattr(me, "first_name", "") or "",
         )
-        await event.respond(main_text(uid), buttons=main_buttons(), parse_mode="md")
+        await event.respond(main_text(uid), buttons=main_buttons(uid), parse_mode="md")
 
     @bot.on(events.NewMessage(pattern=r"^/logout$"))
     @guarded
@@ -2830,14 +3354,15 @@ def register_handlers(bot: TelegramClient) -> None:
         await do_logout(uid)
         await event.respond(
             "✅ Logged out. Session deleted.",
-            buttons=main_buttons(),
+            buttons=main_buttons(uid),
             parse_mode="md",
         )
 
     @bot.on(events.NewMessage(pattern=r"^/errors$"))
     @guarded
     async def _errors(event):
-        if not is_owner(event.sender_id):
+        # error log is for the bot owner only
+        if event.sender_id != owner_id():
             return
         text, btns = errors_view()
         await event.respond(text, buttons=btns, parse_mode="md")
@@ -2891,7 +3416,7 @@ def register_handlers(bot: TelegramClient) -> None:
         # --- 2FA password (QR or phone login) -------------------------------
         if RT.is_2fa(uid):
             await _tidy(event)
-            client = RT.login_client or RT.user
+            client = PENDING.get(uid) or ACCOUNTS.get(uid)
             if not client:
                 RT.set_2fa(uid, False)
                 await event.respond("❌ Session expired. Try /start again.")
@@ -2908,19 +3433,19 @@ def register_handlers(bot: TelegramClient) -> None:
                 RT.set_2fa(uid, False)
                 RT.twofa_tries.pop(uid, None)
                 await event.respond("❌ Too many wrong passwords. Start the login again.",
-                                    buttons=main_buttons())
+                                    buttons=main_buttons(uid))
                 return
             except WAIT_ERRORS as e:
                 RT.set_2fa(uid, False)
                 await event.respond(f"⏳ Too many attempts. Wait {fmt_mmss(getattr(e, 'seconds', 60))}.",
-                                    buttons=main_buttons())
+                                    buttons=main_buttons(uid))
                 return
             except Exception as e:
                 record_error("2fa", e)
                 RT.set_2fa(uid, False)
                 await event.respond(
                     f"❌ 2FA failed: `{_short(e, 200).replace('`', chr(39))}`",
-                    buttons=main_buttons(), parse_mode="md",
+                    buttons=main_buttons(uid), parse_mode="md",
                 )
                 return
             try:
@@ -2929,10 +3454,23 @@ def register_handlers(bot: TelegramClient) -> None:
                 record_error("finish-2fa", e)
             return
 
+        # --- Halloween settings input ---------------------------------------
+        hk = RT.await_input.get(uid)
+        if hk in ("hal_trigger", "hal_extra") and not (event.raw_text or "").startswith("/"):
+            ok, msg = hal_apply_input(uid, hk, event.raw_text or "")
+            if ok:
+                RT.await_input.pop(uid, None)
+                text, btns = hal_view(uid, msg)
+                await event.respond(text, buttons=btns, parse_mode="md")
+            else:
+                await event.respond(f"❌ {msg} Try again.",
+                                    buttons=[[Button.inline("◀️ Cancel", b"hal:menu")]])
+            return
+
         # settings input (base / multiplier / wait / max / meow ...)
         key = RT.await_input.get(uid)
         raw = event.raw_text or ""
-        if key and is_owner(uid) and not raw.startswith("/"):
+        if key and uid == owner_id() and not raw.startswith("/"):
             ok, msg = apply_input(key, raw)
             if ok:
                 RT.await_input.pop(uid, None)
@@ -2983,7 +3521,7 @@ async def route_cb(event, data: str, edit):
         if not is_owner(uid):
             return
         await reset_login_state(uid)
-        await edit(event, main_text(uid), main_buttons())
+        await edit(event, main_text(uid), main_buttons(uid))
         return
 
     if data.startswith("ph:"):
@@ -2996,19 +3534,59 @@ async def route_cb(event, data: str, edit):
         if not is_owner(uid):
             return
         await do_logout(uid)
-        await edit(event, "✅ Logged out. Session deleted.", main_buttons())
+        await edit(event, "✅ Logged out. Session deleted.", main_buttons(uid))
         return
 
     if data == "nav:main":
         if not is_owner(uid):
             return
         RT.await_input.pop(uid, None)
-        await edit(event, main_text(uid), main_buttons())
+        await edit(event, main_text(uid), main_buttons(uid))
         return
 
-    # ---------------- MiaoBet ----------------
+    # ---------------- Halloween (any logged-in user) ----------------
+    if data.startswith("hal:"):
+        if uid not in ACCOUNTS:
+            return
+        e = hal_engine(uid)
+        if data == "hal:menu":
+            RT.await_input.pop(uid, None)
+            text, btns = hal_view(uid)
+        elif data == "hal:start":
+            hcfg(uid)["on"] = True
+            err = e.start()
+            if err:
+                hcfg(uid)["on"] = False
+            save_config()
+            text, btns = hal_view(uid, f"⚠️ {err}" if err else "▶️ Started.")
+        elif data == "hal:stop":
+            e.stop()
+            hcfg(uid)["on"] = False
+            save_config()
+            text, btns = hal_view(uid, "⏹ Stopped.")
+        elif data == "hal:reset":
+            c = hcfg(uid)
+            c.update(runs=0, gifts=0, elixirs=0, failed=0, last="", last_candy=None)
+            save_config()
+            text, btns = hal_view(uid, "🗑 Counters reset.")
+        elif data.startswith("hal:set:"):
+            k = "hal_" + data.split(":")[2]
+            if k not in ("hal_trigger", "hal_extra"):
+                return
+            RT.await_input[uid] = k
+            prompt = ("✏️ Send the **text** that opens the Halloween panel."
+                      if k == "hal_trigger" else
+                      "⏱ Send the **extra seconds** after the shop timer ends (0–30), e.g. `2`.")
+            await edit(event, prompt, [[Button.inline("◀️ Cancel", b"hal:menu")]])
+            return
+        else:
+            return
+        await edit(event, text, btns)
+        return
+
+    # ---------------- MiaoBet (owner account only) ----------------
     if data == "nav:bet" or data.startswith("bet:"):
-        if not is_owner(uid) or RT.user is None:
+        if uid != owner_id() or RT.user is None:
             return
         eng = RT.engine
         mt = RT.meow
@@ -3210,14 +3788,25 @@ async def _watchdog() -> None:
         try:
             for u_ in list(RT.phone_flow):
                 flow_get(u_)  # drops expired login attempts
-            for name, c in (("user", RT.user), ("bot", RT.bot), ("login", RT.login_client)):
+            clients = [("bot", RT.bot)] \
+                + [(f"user{u}", c) for u, c in ACCOUNTS.items()] \
+                + [(f"login{u}", c) for u, c in PENDING.items()]
+            for name, c in clients:
                 if c is not None and not c.is_connected():
-                    log.warning(f"watchdog: {name} client disconnected — reconnecting")
+                    log.warning(f"watchdog: {name} disconnected — reconnecting")
                     await c.connect()
             if RT.user is not None:
                 if CONFIG.get("meow_on") and CONFIG.get("meow_chat") and not RT.meow.running:
                     log_meow.warning("watchdog: meow loop was not running — restarting")
                     RT.meow.start()
+            for uid_, cfg_ in list(CONFIG.get("hal", {}).items()):
+                try:
+                    u = int(uid_)
+                except ValueError:
+                    continue
+                if cfg_.get("on") and cfg_.get("chat") and u in ACCOUNTS and not hal_engine(u).running:
+                    log_hal.warning(f"watchdog: halloween loop of {u} was not running — restarting")
+                    hal_engine(u).start()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3272,33 +3861,48 @@ async def boot_bot() -> None:
 
     register_handlers(RT.bot)
 
-    # Auto-load existing user session if present
-    if (DB_DIR / "user.session").exists():
+    # old sqlite user.session -> StringSession file (once)
+    await migrate_old_session()
+
+    # load every saved account
+    for p in sorted(SESS_DIR.glob("*.txt")):
         try:
-            RT.user = _make_user_client()
-            await RT.user.connect()
-            if await RT.user.is_user_authorized():
-                me2 = await RT.user.get_me()
-                log_bot.info(f"user session loaded: {me2.first_name} (id={me2.id})")
+            uid = int(p.stem)
+        except ValueError:
+            continue
+        c = _make_user_client(uid)
+        try:
+            await c.connect()
+            if not await c.is_user_authorized():
+                log_bot.warning(f"session {uid} not authorized — removed")
+                await c.disconnect()
+                drop_session(uid)
+                continue
+            me2 = await c.get_me()
+            ACCOUNTS[uid] = c
+            ensure_user(uid, username=me2.username or "", first_name=me2.first_name or "",
+                        phone=me2.phone or "")
+            attach_user_handlers(c)
+            log_bot.info(f"session loaded: {me2.first_name} (uid={uid})")
+            if uid == owner_id() or (not owner_id() and RT.user is None):
                 if not CONFIG["owner_id"]:
-                    CONFIG["owner_id"] = me2.id
+                    CONFIG["owner_id"] = uid
                     save_config()
-                attach_user_handlers(RT.user)
+                RT.user = c
                 if CONFIG.get("meow_on") and CONFIG.get("meow_chat"):
                     err = RT.meow.start()
                     log_meow.info("meow auto-started" if not err else f"meow not started: {err}")
-            else:
-                log_bot.warning("user.session not authorized — QR login needed")
-                try:
-                    await RT.user.disconnect()
-                except Exception:
-                    pass
-                RT.user = None
+            if hcfg(uid)["on"] and hcfg(uid)["chat"]:
+                err = hal_engine(uid).start()
+                log_hal.info(f"[{uid}] halloween auto-started" if not err else f"[{uid}] not started: {err}")
         except Exception as e:
-            record_error("load-user-session", e)
-            RT.user = None
-    else:
-        log_bot.info("no user.session — QR login from /start")
+            record_error(f"load-session-{uid}", e)
+            try:
+                await c.disconnect()
+            except Exception:
+                pass
+    if not ACCOUNTS:
+        log_bot.info("no saved sessions — login from /start")
 
     RT.watchdog = spawn(_watchdog(), "watchdog")
     log.info("bot ready — open Telegram and send /start")
@@ -3313,22 +3917,20 @@ async def shutdown() -> None:
         RT.engine.stop()
     if RT.meow:
         RT.meow.stop()
+    for e in HAL.values():
+        e.stop()
     slot_stop()
     for task in list(RT.qr_wait_tasks.values()):
         if task and not task.done():
             task.cancel()
-    if RT.user:
+    for c in list(ACCOUNTS.values()) + list(PENDING.values()):
         try:
-            await RT.user.disconnect()
+            await c.disconnect()
         except Exception:
             pass
-        RT.user = None
-    if RT.login_client:
-        try:
-            await RT.login_client.disconnect()
-        except Exception:
-            pass
-        RT.login_client = None
+    ACCOUNTS.clear()
+    PENDING.clear()
+    RT.user = None
     if RT.bot:
         try:
             await RT.bot.disconnect()
@@ -3435,7 +4037,7 @@ def cmd_reset() -> None:
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="selfbot",
-        description="SELF BOT — QR login + MiaoBet auto-bettor + Meow farmer",
+        description="SELF BOT — QR login + MiaoBet auto-bettor + Meow farmer + Halloween",
     )
     p.add_argument("--config", action="store_true")
     p.add_argument("--reset", action="store_true")
