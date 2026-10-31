@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-SELF BOT — QR/phone login + MiaoBet (Meowie bet) bowling auto-bettor + Meow farmer
-+ Halloween Miyoui shop farmer (multi-user).
+SELF BOT — QR login + MiaoBet (Meowie bet) SLOTS auto-bettor + Meow farmer.
 
 Usage:
   python app.py                 # run the bot
@@ -9,15 +8,19 @@ Usage:
   python app.py --reset         # wipe the database
 
 In a Telegram group, send from your own account:
-  .activegroupsbet   register + activate the group for bowling bets   (owner only)
-  .activemeow        start the auto-meow loop in this group           (owner only)
-  .stopmeow          stop the auto-meow loop                          (owner only)
-  .activehalloween   start the Halloween shop loop in this group      (every logged-in user)
-  .stophalloween     stop the Halloween shop loop                     (every logged-in user)
+  .activegroupsbet   register + activate the group for slot bets
+  .activemeow        start the auto-meow loop in this group
+  .stopmeow          stop the auto-meow loop
+
+Slots round (one 🎰 per round):
+  میوبت -> تک نفره -> اسلات -> تعیین مبلغ ورودی (reply) -> شروع بازی -> reply 🎰
+  result multiplier:  1x      -> same bet again
+                      >1x     -> back to the base bet   (1.5x 2x 2.5x 3x ...)
+                      0.5x/0x -> bet x3 (multiplier is configurable)
 
 Login: QR code, or phone number (code typed by hand OR a safe-style keypad).
 
-Then open the control bot -> MiaoBet / Halloween.
+Then open the control bot -> MiaoBet.
 """
 from __future__ import annotations
 
@@ -57,9 +60,8 @@ try:
     import telethon.errors as tg_errors
     from telethon import Button, TelegramClient, events
     from telethon.errors import FloodWaitError, MessageNotModifiedError, SessionPasswordNeededError
-    from telethon.sessions import StringSession
     from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
-    from telethon.tl.types import InputMediaDice, MessageMediaDice
+    from telethon.tl.types import ChannelParticipantsBots, InputMediaDice, MessageMediaDice
 except ImportError:
     print("ERROR: telethon not installed. Run: pip install telethon", file=sys.stderr)
     sys.exit(1)
@@ -131,13 +133,17 @@ PUBLIC_API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
 MIN_BET = 20_000                       # minimum allowed bet
 GAME_TRIGGER = "میوبت"                 # text that opens the game panel
 BTN_SINGLE = "miobet_player_single"    # panel 1: single player
-BTN_BOWLING = "miobet_game_bowling"    # panel 2: bowling
-BTN_CHOICE = "miobet_choice_{}"        # panel 3: odd | even
+# The buttons below are found by callback-data substring OR by their visible text,
+# so the bot works even if the exact callback names differ from my guess.
+SLOT_KEYS = ("slot",)                  # panel 2: slots (data contains this ...)
+SLOT_TEXTS = ("اسلات",)                # ... or the button text contains this
+AMOUNT_TEXTS = ("تعیین مبلغ", "تغییر مبلغ")   # panel 3/5: set / change the entry amount
+START_TEXTS = ("شروع بازی",)           # panel 5: start the game
+PROMPT_HINTS = ("جواب همین", "درحال تعیین")   # text of the "reply with the amount" prompt
+SLOT_GAP = 60                          # the bot forces 60s between slot games
 GROUP_CMD = r"^\.activegroupsbet$"     # sent inside a group to activate it
 MEOW_ON_CMD = r"^\.activemeow$"        # sent inside a group to start meowing
 MEOW_OFF_CMD = r"^\.stopmeow$"         # sent inside a group to stop meowing
-HAL_ON_CMD = r"^\.activehalloween$"    # sent inside a group to start the Halloween loop
-HAL_OFF_CMD = r"^\.stophalloween$"     # sent inside a group to stop it
 
 
 def _env_str(key: str, default: str = "") -> str:
@@ -164,6 +170,8 @@ def _env_bool(key: str, default: bool) -> bool:
     if raw in ("0", "false", "no", "off", "n", "f", "disable", "disabled"):
         return False
     guess = raw[0] in "ty1"          # 'ture', 'treu', 'yse' ...
+    if raw[0] in "tyf10n" and raw[:2] != "of" or raw.startswith("off"):
+        guess = raw[0] in "ty1"
     print(f"WARNING: {key}={raw!r} is not a valid boolean — treating it as {guess}. "
           f"Use true/false.", file=sys.stderr)
     return guess
@@ -174,24 +182,25 @@ CONFIG: Dict[str, Any] = {
     "api_hash": _env_str("API_HASH", PUBLIC_API_HASH),
     "bot_token": _env_str("BOT_TOKEN", ""),
     "owner_id": _env_int("OWNER_ID", 0),
-    # True  = every user who sends /start may use the bot panel (own account + Halloween)
+    # True  = every user who sends /start may use the bot panel
     # False = only owner_id (the first person who logs in) may use it
     "allow_all_users": _env_bool("ALLOW_ALL_USERS", True),
     "use_proxy": _env_bool("USE_PROXY", True),
     "proxy_url": _env_str("PROXY_URL", "socks5://127.0.0.1:1080"),
-    # MiaoBet
+    # MiaoBet (slots)
     "bet_chat": 0,          # active group chat id
     "bet_base": 20000,      # base (first) bet
-    "bet_mult": 3,          # multiplier after a loss
-    "bet_choice": "odd",    # odd | even
-    "bet_cooldown": 61,     # seconds to wait after each result
+    "bet_mult": 3,          # multiplier after a 0x / 0.5x result
+    "bet_cooldown": 61,     # seconds to wait after each result (bot needs 60)
     "bet_max": 0,           # 0 = no cap; stop if next bet would exceed it
-    "bet_current": 0,       # current stake in the martingale ladder
+    "bet_current": 0,       # current stake in the ladder
     "bet_delay": 1.0,       # seconds between every click / message in a round
-    "bet_allin": True,      # if next bet (x mult) > balance -> bet the whole balance
+    "bet_allin": True,      # if next bet (x mult) > KNOWN balance -> bet the whole balance
     "captcha_on": True,     # auto-answer the game bot's math captcha
     "captcha_solved": 0,    # how many captchas were answered
-    "captcha_all": True,    # True = answer in every group you are in, False = active group only
+    "captcha_all": True,    # True = every group except the ones you switched off, False = only switched-on groups
+    "game_bot_name": "meowie",   # (lower-case) part of the game bot's display name, used to detect it
+    "game_bot_username": "",     # optional: exact username of the game bot (without @)
     # Meow farmer
     "meow_on": False,       # loop enabled (re-started automatically on boot)
     "meow_chat": 0,         # group where .activemeow was sent
@@ -210,8 +219,6 @@ CONFIG: Dict[str, Any] = {
     "slot_throws": 0,
     "slot_matches": 0,
     "slot_wins": 0,
-    # Halloween Miyoui — per-user settings: {"<uid>": {...}}
-    "hal": {},
 }
 
 CONFIG_FILE = DB_DIR / "config.json"
@@ -300,7 +307,6 @@ log = get_log("main")
 log_bot = get_log("bot")
 log_bet = get_log("bet")
 log_meow = get_log("meow")
-log_hal = get_log("halloween")
 
 console = Console() if RICH else None
 
@@ -505,6 +511,12 @@ CREATE TABLE IF NOT EXISTS bets (
     net       INTEGER DEFAULT 0,
     balance   INTEGER
 );
+CREATE TABLE IF NOT EXISTS cap_groups (
+    chat_id   INTEGER PRIMARY KEY,
+    title     TEXT    DEFAULT '',
+    enabled   INTEGER DEFAULT 1,
+    added_at  TEXT    DEFAULT ''
+);
 """
 
 
@@ -624,6 +636,42 @@ def db_group_title(chat_id: int) -> str:
     return r["title"] if r else str(chat_id)
 
 
+# --- captcha groups (groups where the game bot was detected) -------------------
+def db_cap_add(chat_id: int, title: str) -> bool:
+    """Add a group (enabled). An existing row keeps its on/off state. Returns True if it was new."""
+    init_db()
+    existed = db_exec("SELECT 1 FROM cap_groups WHERE chat_id=?", (int(chat_id),)).fetchone()
+    db_exec(
+        "INSERT INTO cap_groups (chat_id, title, enabled, added_at) VALUES (?,?,1,?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title",
+        (int(chat_id), title or "", _now()),
+    )
+    return existed is None
+
+
+def db_cap_list() -> List[dict]:
+    init_db()
+    rows = db_exec("SELECT * FROM cap_groups ORDER BY title COLLATE NOCASE").fetchall()
+    return [dict(r) for r in rows]
+
+
+def db_cap_state(chat_id: int) -> Optional[int]:
+    """None = unknown group, 1 = captcha ON for it, 0 = switched OFF by the user."""
+    init_db()
+    r = db_exec("SELECT enabled FROM cap_groups WHERE chat_id=?", (int(chat_id),)).fetchone()
+    return int(r["enabled"]) if r else None
+
+
+def db_cap_toggle(chat_id: int) -> Optional[bool]:
+    init_db()
+    cur = db_cap_state(chat_id)
+    if cur is None:
+        return None
+    new = 0 if cur else 1
+    db_exec("UPDATE cap_groups SET enabled=? WHERE chat_id=?", (new, int(chat_id)))
+    return bool(new)
+
+
 # --- bets -------------------------------------------------------------------
 def db_add_bet(chat_id, choice, amount, dice, total, won, net, balance) -> None:
     init_db()
@@ -635,16 +683,14 @@ def db_add_bet(chat_id, choice, amount, dice, total, won, net, balance) -> None:
     )
 
 
-def db_all_bets() -> List[dict]:
+def db_all_bets(slot_only: bool = True) -> List[dict]:
+    """Slot rounds only by default (old bowling rows stay in the DB but are ignored)."""
     init_db()
-    rows = db_exec("SELECT * FROM bets ORDER BY id").fetchall()
+    if slot_only:
+        rows = db_exec("SELECT * FROM bets WHERE choice='slot' ORDER BY id").fetchall()
+    else:
+        rows = db_exec("SELECT * FROM bets ORDER BY id").fetchall()
     return [dict(r) for r in rows]
-
-
-def db_last_balance() -> Optional[int]:
-    init_db()
-    r = db_exec("SELECT balance FROM bets WHERE balance IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
-    return int(r["balance"]) if r and r["balance"] is not None else None
 
 
 def db_clear_bets() -> None:
@@ -726,15 +772,94 @@ def solve_captcha(text: Optional[str]) -> Optional[int]:
     return None
 
 
-def btn_data(msg, key: str) -> Optional[bytes]:
-    """Return callback data of the first inline button whose data contains key."""
+def find_btn(msg, keys: tuple = (), texts: tuple = ()) -> Optional[bytes]:
+    """
+    Callback data of the first inline button whose data contains one of `keys`
+    OR whose visible text contains one of `texts`.
+    """
     rm = getattr(msg, "reply_markup", None)
     for row in getattr(rm, "rows", None) or []:
         for b in getattr(row, "buttons", None) or []:
             d = getattr(b, "data", None)
-            if d and key.encode() in d:
+            if not d:
+                continue
+            label = clean(getattr(b, "text", "") or "")
+            if any(k.encode() in d for k in keys) or any(clean(t) in label for t in texts):
                 return d
     return None
+
+
+def is_game_bot(user) -> bool:
+    """Is this Telegram user the Meowie bet game bot? (by username, else by display name)"""
+    if not getattr(user, "bot", False):
+        return False
+    uname = (getattr(user, "username", None) or "").lower()
+    want_un = str(CONFIG.get("game_bot_username") or "").lstrip("@").lower()
+    if want_un and uname == want_un:
+        return True
+    name = clean(f"{getattr(user, 'first_name', '') or ''} {getattr(user, 'last_name', '') or ''}").lower()
+    want = str(CONFIG.get("game_bot_name") or "").strip().lower()
+    return bool(want) and want in name
+
+
+# --- slot result / popup parsing ----------------------------------------------
+#   مبلغ دریافتی : 25,000 میو (0.5x)   7 🍋🍇 | امتیاز: 28
+_SLOT_GOT_RE = re.compile(r"مبلغ\s*دریافتی\D*?(\d[\d,]*)")
+_SLOT_MULT_RE = re.compile(
+    r"\(\s*(\d+(?:\.\d+)?)\s*[xX×]\s*\)|\(\s*[xX×]\s*(\d+(?:\.\d+)?)\s*\)"
+)
+#   ⏳ باید 60 ثانیه بین بازی‌های اسلات فاصله باشه. 30 ثانیه دیگه تلاش کن.
+_COOLDOWN_RE = re.compile(r"(\d+)\s*ثانیه\s*دیگه")
+
+
+def is_slot_result(text: Optional[str]) -> bool:
+    return _SLOT_GOT_RE.search(clean(text).replace("`", "")) is not None
+
+
+def parse_slot_result(text: Optional[str], amount: int) -> Optional[dict]:
+    """-> {'mult': float, 'received': int} or None."""
+    t = clean(text).replace("`", "")
+    g = _SLOT_GOT_RE.search(t)
+    m = _SLOT_MULT_RE.search(t)
+    if not g and not m:
+        return None
+    received = int(re.sub(r"\D", "", g.group(1)) or 0) if g else None
+    mult = float(m.group(1) or m.group(2)) if m else None
+    if mult is None and received is not None and amount:
+        mult = received / amount
+    if received is None and mult is not None:
+        received = int(round(amount * mult))
+    if mult is None or received is None:
+        return None
+    return {"mult": mult, "received": received}
+
+
+def parse_cooldown(text: Optional[str]) -> Optional[int]:
+    """Seconds left from the bot's 'wait N seconds' popup, else None."""
+    t = clean(text)
+    if not t or "ثانیه" not in t:
+        return None
+    m = _COOLDOWN_RE.search(t)
+    if m:
+        return min(int(m.group(1)), 300)
+    if "فاصله" in t:
+        n = re.search(r"(\d+)", t)
+        return min(int(n.group(1)), 300) if n else SLOT_GAP
+    return None
+
+
+def next_stake(mult: float, amount: int, base: int, factor: float) -> Tuple[int, str]:
+    """
+    The slot ladder.
+        exactly 1x         -> same bet again
+        more than 1x       -> back to the base bet   (1.5x 2x 2.5x 3x ...)
+        less than 1x       -> bet x factor           (0.5x and 0x)
+    """
+    if abs(mult - 1.0) < 1e-9:
+        return amount, "same"
+    if mult > 1.0:
+        return base, "reset"
+    return int(round(amount * factor)), "raise"
 
 
 # --- meow reply parsing -----------------------------------------------------
@@ -779,8 +904,6 @@ def parse_meow(text: Optional[str]) -> Optional[dict]:
 class Runtime:
     def __init__(self):
         self.bot: Optional[TelegramClient] = None
-        # RT.user = the OWNER's authorized account (used by MiaoBet / Meow / Captcha / Slot).
-        # Every logged-in account (owner included) also lives in ACCOUNTS.
         self.user: Optional[TelegramClient] = None
         self.stop_evt: Optional[asyncio.Event] = None   # created inside the running loop
         self.qr_wait_tasks: Dict[int, asyncio.Task] = {}
@@ -789,8 +912,12 @@ class Runtime:
         self.engine: Optional["BetEngine"] = None
         self.meow: Optional["MeowEngine"] = None
         self.watchdog: Optional[asyncio.Task] = None
+        # a client that is connected but NOT authorized yet (QR / phone login in progress).
+        # RT.user is only set once the login really succeeded.
+        self.login_client: Optional[TelegramClient] = None
         self.phone_flow: Dict[int, dict] = {}
         self.twofa_tries: Dict[int, int] = {}
+        self.scanning: bool = False      # a group scan is running
 
     def is_2fa(self, uid: int) -> bool:
         return bool(self.qr_2fa.get(uid))
@@ -863,53 +990,10 @@ _CONN_KW = dict(
 )
 
 
-# --- per-user sessions (StringSession: one text file per user, no SQLite lock) ---
-SESS_DIR = DB_DIR / "sessions"
-SESS_DIR.mkdir(exist_ok=True)
-ACCOUNTS: Dict[int, TelegramClient] = {}   # uid -> authorized client
-PENDING: Dict[int, TelegramClient] = {}    # uid -> client in the middle of login
-
-
-def load_session_str(uid: int) -> str:
-    p = SESS_DIR / f"{uid}.txt"
-    try:
-        return p.read_text(encoding="utf-8").strip() if p.exists() else ""
-    except Exception:
-        return ""
-
-
-def save_session(uid: int, client: TelegramClient) -> None:
-    try:
-        p = SESS_DIR / f"{uid}.txt"
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(StringSession.save(client.session), encoding="utf-8")
-        try:
-            os.chmod(tmp, 0o600)
-        except Exception:
-            pass
-        os.replace(tmp, p)
-    except Exception as e:
-        record_error("save_session", e)
-
-
-def drop_session(uid: int) -> None:
-    try:
-        (SESS_DIR / f"{uid}.txt").unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-def uid_of(client) -> Optional[int]:
-    for u, c in ACCOUNTS.items():
-        if c is client:
-            return u
-    return None
-
-
-def _make_user_client(uid: int) -> TelegramClient:
+def _make_user_client() -> TelegramClient:
     api_id, api_hash = _api_creds()
     return TelegramClient(
-        StringSession(load_session_str(uid)),
+        str(DB_DIR / "user.session"),
         api_id,
         api_hash,
         proxy=_proxy_tuple(),
@@ -933,44 +1017,16 @@ def _make_bot_client() -> TelegramClient:
     )
 
 
-async def migrate_old_session() -> None:
-    """user.session (sqlite) -> sessions/<owner>.txt, once."""
-    old_f = DB_DIR / "user.session"
-    if not old_f.exists() or list(SESS_DIR.glob("*.txt")):
-        return
-    api_id, api_hash = _api_creds()
-    old = TelegramClient(str(old_f), api_id, api_hash, proxy=_proxy_tuple())
-    try:
-        await old.connect()
-        if await old.is_user_authorized():
-            me = await old.get_me()
-            target = owner_id() or me.id
-            ss = StringSession()
-            ss.set_dc(old.session.dc_id, old.session.server_address, old.session.port)
-            ss.auth_key = old.session.auth_key
-            (SESS_DIR / f"{target}.txt").write_text(ss.save(), encoding="utf-8")
-            if not CONFIG["owner_id"]:
-                CONFIG["owner_id"] = target
-                save_config()
-            log.info(f"old user.session migrated -> sessions/{target}.txt")
-    except Exception as e:
-        record_error("migrate-session", e)
-    finally:
-        try:
-            await old.disconnect()
-        except Exception:
-            pass
-    try:
-        old_f.replace(old_f.with_suffix(".migrated"))
-    except Exception:
-        pass
-
-
 # ===========================================================================
-# 6. MIAOBET ENGINE
+# 6. MIAOBET ENGINE  (slots, ONE 🎰 per round)
 # ===========================================================================
 class BetEngine:
-    """Martingale bowling bettor driven by the owner's account (RT.user)."""
+    """
+    Slot bettor driven by the user account (RT.user).
+
+    Round:  میوبت → تک نفره → اسلات → تعیین مبلغ ورودی (reply the amount)
+            → شروع بازی → reply 🎰 to the start message → read the result.
+    """
 
     def __init__(self):
         self.task: Optional[asyncio.Task] = None
@@ -978,7 +1034,7 @@ class BetEngine:
         self.state = "stopped"
         self.game_bot_id = 0
         self.last_bot_text = ""
-        self.last_balance: Optional[int] = None
+        self.last_balance: Optional[int] = None   # only known if the bot ever shows it
         self.next_run_at: Optional[float] = None
 
     # --- control -----------------------------------------------------------
@@ -995,8 +1051,6 @@ class BetEngine:
             return "No active group. Send .activegroupsbet inside a group."
         self.game_bot_id = 0
         self._clear_waiters()
-        if self.last_balance is None:
-            self.last_balance = db_last_balance()
         self.task = spawn(self._loop(), "bet-loop")
         return None
 
@@ -1046,6 +1100,11 @@ class BetEngine:
         self.waiters.append((pred, fut))
         return fut
 
+    def _drop(self, fut: asyncio.Future) -> None:
+        self.waiters = [w for w in self.waiters if w[1] is not fut]
+        if not fut.done():
+            fut.cancel()
+
     async def wait(self, fut: asyncio.Future, timeout: float):
         try:
             return await asyncio.wait_for(fut, timeout)
@@ -1053,23 +1112,25 @@ class BetEngine:
             self.waiters = [w for w in self.waiters if w[1] is not fut]
             return None
 
-    async def _click(self, msg, key: str) -> None:
-        data = btn_data(msg, key)
+    async def _click(self, msg, keys: tuple = (), texts: tuple = ()) -> str:
+        """Press an inline button. Returns the popup text the bot answered with ('' if none)."""
+        data = find_btn(msg, keys, texts)
         if data is None:
-            raise RuntimeError(f"button '{key}' not found")
+            raise RuntimeError(f"button {keys or texts} not found")
         client = RT.user
         if client is None:
             raise RuntimeError("logged out")
         peer = await client.get_input_entity(int(CONFIG["bet_chat"]))
         try:
-            await client(GetBotCallbackAnswerRequest(peer=peer, msg_id=msg.id, data=data))
+            ans = await client(GetBotCallbackAnswerRequest(peer=peer, msg_id=msg.id, data=data))
         except WAIT_ERRORS:
             raise
         except Exception as e:
             # bots that never answer the callback raise a timeout; the click still counted
             if "BotResponseTimeout" in type(e).__name__:
-                return
+                return ""
             raise
+        return clean(getattr(ans, "message", "") or "").strip()
 
     # --- one round ---------------------------------------------------------
     async def run_round(self) -> Tuple[str, str]:
@@ -1077,26 +1138,28 @@ class BetEngine:
         if client is None:
             return "stop", "Logged out."
         chat = int(CONFIG["bet_chat"])
-        choice = CONFIG["bet_choice"]
         amount = self.current_bet()
         t0 = datetime.now(timezone.utc) - timedelta(seconds=20)
         delay = max(float(CONFIG.get("bet_delay") or 1.0), 0.0)
+        ids: set = set()          # message ids that belong to THIS round (ours)
 
-        def btn_pred(key):
-            return lambda m: m.date >= t0 and btn_data(m, key) is not None
+        def mine(m) -> bool:
+            """Ignore the bot's answers to other players in the same group."""
+            rt = getattr(m, "reply_to_msg_id", None)
+            return rt is None or not ids or rt in ids
 
-        def text_pred(sub):
-            return lambda m: m.date >= t0 and sub in clean(m.raw_text)
+        def btn_pred(keys: tuple = (), texts: tuple = ()):
+            return lambda m: m.date >= t0 and mine(m) and find_btn(m, keys, texts) is not None
 
-        def result_pred(m):
-            return m.date >= t0 and re.search(
-                r"\[\s*\d+\s*(?:,\s*\d+\s*)+\]", clean(m.raw_text)
-            ) is not None
+        def text_pred(*subs):
+            return lambda m: (m.date >= t0 and mine(m)
+                              and any(s in clean(m.raw_text) for s in subs))
 
         # 1) open the panel
         self.state = "opening panel"
-        f1 = self.expect(btn_pred(BTN_SINGLE))
-        await tg_call(lambda: client.send_message(chat, GAME_TRIGGER), "open panel")
+        f1 = self.expect(btn_pred((BTN_SINGLE,)))
+        trig = await tg_call(lambda: client.send_message(chat, GAME_TRIGGER), "open panel")
+        ids.add(trig.id)
         m1 = await self.wait(f1, 25)
         if not m1:
             return "fail", f"no panel after '{GAME_TRIGGER}' (last: {self.last_bot_text[:80]})"
@@ -1104,102 +1167,123 @@ class BetEngine:
 
         # 2) single player
         self.state = "single player"
-        f2 = self.expect(btn_pred(BTN_BOWLING))
+        f2 = self.expect(btn_pred(SLOT_KEYS, SLOT_TEXTS))
         await asyncio.sleep(delay)
-        await self._click(m1, BTN_SINGLE)
+        await self._click(m1, keys=(BTN_SINGLE,))
         m2 = await self.wait(f2, 15)
         if not m2:
-            return "fail", "bowling button never appeared"
+            return "fail", "slots button never appeared"
 
-        # 3) bowling
-        self.state = "bowling"
-        ckey = BTN_CHOICE.format(choice)
-        f3 = self.expect(btn_pred(ckey))
+        # 3) slots
+        self.state = "slots"
+        f3 = self.expect(btn_pred(texts=AMOUNT_TEXTS))
         await asyncio.sleep(delay)
-        await self._click(m2, BTN_BOWLING)
+        await self._click(m2, SLOT_KEYS, SLOT_TEXTS)
         m3 = await self.wait(f3, 15)
         if not m3:
-            return "fail", f"choice button '{ckey}' never appeared"
+            return "fail", "'set entry amount' button never appeared"
 
-        # 4) odd / even
-        self.state = f"choice {choice}"
-        f4 = self.expect(text_pred("مبلغ شرط"))
+        # 4) set entry amount -> the bot asks for the amount as a reply
+        self.state = "setting amount"
+        f4 = self.expect(text_pred(*PROMPT_HINTS))
         await asyncio.sleep(delay)
-        await self._click(m3, ckey)
+        await self._click(m3, texts=AMOUNT_TEXTS)
         m4 = await self.wait(f4, 15)
         if not m4:
             return "fail", "amount prompt never appeared"
 
-        # 5) amount as a reply to the prompt
+        # 5) amount, sent as a reply to the prompt
         self.state = f"bet {fmt_k(amount)}"
-        f5 = self.expect(text_pred("ثبت شد"))
+        f5 = self.expect(btn_pred(texts=START_TEXTS))
         await asyncio.sleep(delay)
-        await tg_call(
-            lambda: client.send_message(chat, amount_to_send(amount), reply_to=m4.id), "send amount"
+        sent = await tg_call(
+            lambda: client.send_message(chat, str(amount), reply_to=m4.id), "send amount"
         )
+        ids.add(sent.id)
         m5 = await self.wait(f5, 20)
         if not m5:
-            return "fail", f"bet not registered (last: {self.last_bot_text[:100]})"
+            return "fail", f"amount not accepted (last: {self.last_bot_text[:100]})"
+        ids.add(m5.id)
+        if f"{amount:,}" not in clean(m5.raw_text):
+            log_bet.warning(f"panel does not show {amount:,}: {clean(m5.raw_text)[:100]!r}")
 
-        # 6) three bowling dice
-        self.state = "throwing 🎳🎳🎳"
-        f6 = self.expect(result_pred)
-        await asyncio.sleep(delay)
-        for _ in range(3):
-            await tg_call(lambda: client.send_file(chat, InputMediaDice("🎳")), "throw dice")
-            await asyncio.sleep(max(delay, 1.0))
-        m6 = await self.wait(f6, 90)
-        if not m6:
-            return "fail", "no result message (timeout / penalty?)"
-
-        # 7) parse result
-        txt = clean(m6.raw_text)
-        mm = re.search(r"\[([^\]]*)\]", txt)
-        dice = [int(x) for x in re.findall(r"\d+", mm.group(1))] if mm else []
-        total = sum(dice)
-        if "باختی" in txt:
-            won = False
-        elif "بردی" in txt or "برنده" in txt:
-            won = True
+        # 6) start the game (the bot forces 60s between slot games -> wait + retry)
+        self.state = "starting game"
+        m6, ans = None, ""
+        for _ in range(4):
+            f6 = self.expect(lambda m: m.date >= t0 and mine(m))
+            await asyncio.sleep(delay)
+            ans = await self._click(m5, texts=START_TEXTS)
+            left = parse_cooldown(ans)
+            if left is not None:
+                self._drop(f6)
+                self.state = f"slot cooldown {left}s"
+                log_bet.info(f"slot cooldown popup: wait {left}s")
+                await asyncio.sleep(left + 1)
+                continue
+            m6 = await self.wait(f6, 12)
+            break
         else:
-            won = (total % 2 == 1) == (choice == "odd")
+            return "fail", "slot cooldown never ended"
+        if m6 is None:
+            m6 = m5        # the start message may simply be the edited panel
+        ids.add(m6.id)
 
-        bm = re.search(r"موجودی جدید\D*([\d,]+)", txt)
-        bdigits = bm.group(1).replace(",", "") if bm else ""
-        balance = int(bdigits) if bdigits else None
+        # 7) ONE 🎰, as a reply to the start message
+        self.state = "throwing 🎰"
+        amt_now = amount
+        f7 = self.expect(lambda m: m.date >= t0 and mine(m) and is_slot_result(m.raw_text))
+        await asyncio.sleep(delay)
+        dice = await tg_call(
+            lambda: client.send_file(chat, InputMediaDice("🎰"), reply_to=m6.id), "throw slot"
+        )
+        ids.add(dice.id)
+        m7 = await self.wait(f7, 60)
+        if not m7:
+            extra = f" — popup: {ans[:80]}" if ans else ""
+            return "fail", f"no slot result (timeout / penalty?){extra}"
 
-        net = amount if won else -amount
-        if balance is not None and self.last_balance is not None:
-            diff = balance - self.last_balance
-            if (won and diff > 0) or (not won and diff < 0):
-                net = diff
-        if balance is not None:
-            self.last_balance = balance
+        # 8) read the result
+        res = parse_slot_result(m7.raw_text, amt_now)
+        if res is None:
+            return "fail", f"couldn't read the result: {clean(m7.raw_text)[:100]!r}"
+        mult, received = res["mult"], res["received"]
+        txt = clean(m7.raw_text).replace("`", "")
+        net = received - amount
+        won = net > 0
+
+        bm = re.search(r"موجودی[^\d]{0,20}(\d[\d,]*)", txt)
+        if bm:
+            self.last_balance = int(re.sub(r"\D", "", bm.group(1)) or 0)
+        elif self.last_balance is not None:
+            self.last_balance += net
+        balance = self.last_balance
 
         try:
-            db_add_bet(chat, choice, amount, dice, total, won, net, balance)
+            db_add_bet(chat, "slot", amount, [mult], received, won, net, balance)
         except Exception as e:  # never lose the ladder state because the DB hiccuped
             record_error("db_add_bet", e)
 
         # --- next stake ------------------------------------------------------
         base = max(int(CONFIG["bet_base"]), MIN_BET)
-        mult = float(CONFIG["bet_mult"])
-        nxt = base if won else int(round(amount * mult))
+        factor = float(CONFIG["bet_mult"])
+        nxt, kind = next_stake(mult, amount, base, factor)
         all_in = False
-        if (not won and balance is not None and nxt > balance
+        if (kind == "raise" and balance is not None and nxt > balance
                 and CONFIG.get("bet_allin", True) and balance >= MIN_BET):
-            nxt = balance          # ×mult is more than we own -> put everything in
+            wanted = nxt
+            nxt = balance          # ×factor is more than we own -> put everything in
             all_in = True
         CONFIG["bet_current"] = nxt
         save_config()
         log_bet.info(
-            f"{'WIN' if won else 'LOSS'} bet={amount} dice={dice} total={total} "
-            f"net={net} balance={balance} next={nxt}{' ALL-IN' if all_in else ''}"
+            f"SLOT x{mult:g} bet={amount} got={received} net={net} balance={balance} "
+            f"next={nxt} ({kind}){' ALL-IN' if all_in else ''}"
         )
         if all_in:
             await self.notify(
                 f"🔥 **ALL-IN next round**\n"
-                f"×{mult:g} ladder wanted {fmt_k(int(round(amount * mult)))} but your balance is "
+                f"×{factor:g} ladder wanted {fmt_k(wanted)} but your balance is "
                 f"{balance:,} → betting **{balance:,}**."
             )
 
@@ -1211,7 +1295,7 @@ class BetEngine:
                 f"Next bet {fmt_k(nxt)} is more than your balance {balance:,}"
                 + (f" (and balance is below the {fmt_k(MIN_BET)} minimum)." if balance < MIN_BET else ".")
             )
-        return "ok", "win" if won else "loss"
+        return "ok", f"x{mult:g}"
 
     # --- loop --------------------------------------------------------------
     async def _loop(self) -> None:
@@ -1432,6 +1516,7 @@ async def _on_activate(event) -> None:
     chat = await event.get_chat()
     title = getattr(chat, "title", None) or str(event.chat_id)
     db_add_group(event.chat_id, title)
+    db_cap_add(event.chat_id, title)      # captcha list too (keeps its on/off state)
     set_active_chat(event.chat_id)
     log_bet.info(f"group activated: {title} ({event.chat_id})")
     await _flash(event, f"✅ MiaoBet active in this group: {title}")
@@ -1501,8 +1586,6 @@ def slot_is_start(text: Optional[str]) -> bool:
     return ("چالش اسلات" in t
             or ("اسلات" in t and "کامنت" in t)
             or ("کازینو" in t and "کامنت" in t))
-
-
 _slot_task: Optional[asyncio.Task] = None
 
 
@@ -1701,15 +1784,17 @@ _captcha_done: set = set()
 
 @guard("captcha")
 async def _on_captcha(event) -> None:
-    """Answer the math captcha instantly (every group, or only the active one)."""
+    """
+    Answer the game bot's math captcha instantly.
+      * a group switched OFF in the Captcha panel is never answered
+      * a group switched ON is always answered
+      * a group the bot has never been seen in follows "All groups" (captcha_all)
+      * the first captcha from the game bot in an unknown group registers that group (ON)
+    """
     if not CONFIG.get("captcha_on", True) or not event.is_group:
         return
     ans = solve_captcha(event.raw_text)
     if ans is None:
-        return
-    active = int(CONFIG.get("bet_chat") or 0)
-    is_active = bool(active) and event.chat_id == active
-    if not is_active and not CONFIG.get("captcha_all", True):
         return
     key = (event.chat_id, event.message.id)
     if key in _captcha_done:
@@ -1717,9 +1802,27 @@ async def _on_captcha(event) -> None:
     sender = await event.get_sender()
     if not getattr(sender, "bot", False):
         return
+    active = int(CONFIG.get("bet_chat") or 0)
+    is_active = bool(active) and event.chat_id == active
     eng = RT.engine
     if is_active and eng and eng.game_bot_id and sender.id != eng.game_bot_id:
         return
+
+    state = db_cap_state(event.chat_id)
+    if state is None and is_game_bot(sender):
+        try:
+            chat = await event.get_chat()
+            title = getattr(chat, "title", None) or str(event.chat_id)
+            db_cap_add(event.chat_id, title)
+            state = 1
+            log_bet.info(f"captcha: game bot detected in {title} ({event.chat_id})")
+        except Exception as e:
+            log_bet.warning(f"captcha: could not register group: {type(e).__name__}: {e}")
+    if state == 0:
+        return                                     # switched off by the user
+    if not (is_active or state == 1 or CONFIG.get("captcha_all", True)):
+        return
+
     _captcha_done.add(key)
     if len(_captcha_done) > 2000:
         _captcha_done.clear()
@@ -1733,6 +1836,37 @@ async def _on_captcha(event) -> None:
         log_bet.info(f"captcha answered in {event.chat_id}: {ans}")
     except Exception as e:
         log_bet.warning(f"captcha reply failed in {event.chat_id}: {type(e).__name__}: {e}")
+
+
+async def scan_game_groups(limit: int = 300) -> Tuple[int, int, int]:
+    """
+    Look through your groups for the game bot and register every group it is in.
+    Returns (groups checked, groups with the bot, newly added).
+    """
+    client = RT.user
+    if client is None:
+        return 0, 0, 0
+    checked = found = new = 0
+    async for d in client.iter_dialogs(limit=limit):
+        if not d.is_group:
+            continue
+        checked += 1
+        try:
+            members = await tg_call(
+                lambda: client.get_participants(d.entity, limit=200, filter=ChannelParticipantsBots()),
+                "scan participants", tries=2,
+            )
+        except Exception as e:
+            log_bet.info(f"scan: skipped {d.name!r}: {type(e).__name__}")
+            await asyncio.sleep(0.3)
+            continue
+        if any(is_game_bot(u) for u in members):
+            found += 1
+            if db_cap_add(d.id, d.name or str(d.id)):
+                new += 1
+        await asyncio.sleep(0.4)
+    log_bet.info(f"scan done: {checked} groups, {found} with the game bot, {new} new")
+    return checked, found, new
 
 
 @guard("game-listener", notify=False)
@@ -1754,461 +1888,20 @@ async def _on_game_msg(event) -> None:
     eng.feed(event.message)
 
 
-# ===========================================================================
-# 7b. HALLOWEEN MIYOUI (per-user, every logged-in account)
-# ===========================================================================
-HAL_DEFAULT: Dict[str, Any] = {
-    "on": False, "chat": 0, "title": "", "trigger": "هالووین میویی", "extra": 2.0,
-    "runs": 0, "gifts": 0, "elixirs": 0, "failed": 0, "last_candy": None, "last": "",
-}
-HAL_FAIL_WORDS = ("کافی نیست", "آبنبات کافی", "نداری", "ناموفق", "موجود نیست")
-HAL_OK_WORDS = ("خریدی", "خرید شد", "خرید موفق", "با موفقیت", "خریداری")
-
-
-def hcfg(uid: int) -> dict:
-    d = CONFIG.setdefault("hal", {}).setdefault(str(uid), {})
-    for k, v in HAL_DEFAULT.items():
-        d.setdefault(k, v)
-    return d
-
-
-def parse_hal_timer(text: Optional[str]) -> Optional[int]:
-    """'شارژ مجدد تا : 24 دقیقه 10 ثانیه'  or  'شارژ مجدد تا : 01:24:10'."""
-    t = clean(text).replace("`", "")
-    m = re.search(r"شارژ\s*مجدد\s*تا\s*:?\s*([^\n]+)", t)
-    if not m:
-        return None
-    seg = m.group(1)
-    c = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)", seg)
-    if c:
-        a, b, s = c.groups()
-        return int(a) * 3600 + int(b) * 60 + int(s) if s is not None else int(a) * 60 + int(b)
-    units = {"ساعت": 3600, "دقیقه": 60, "ثانیه": 1}
-    found = re.findall(r"(\d+)\s*(ساعت|دقیقه|ثانیه)", seg)
-    return sum(int(n) * units[u] for n, u in found) if found else None
-
-
-def parse_candy(text: Optional[str]) -> Optional[int]:
-    m = re.search(r"آبنبات\s*هات\s*:?\s*(\d+)", clean(text).replace("`", ""))
-    return int(m.group(1)) if m else None
-
-
-_HAL_ITEM_RE = re.compile(r"(?m)^\W*(\d+)\s*[─—\-–]\s*(.+?)\s*[·•]")
-
-
-def parse_hal_items(text: Optional[str]) -> List[dict]:
-    t = clean(text).replace("`", "")
-    ms = list(_HAL_ITEM_RE.finditer(t))
-    out = []
-    for i, m in enumerate(ms):
-        seg = t[m.end(): ms[i + 1].start() if i + 1 < len(ms) else len(t)]
-        sold = "تموم شد" in seg
-        out.append({"n": int(m.group(1)), "name": m.group(2).strip(),
-                    "avail": ("موجود" in seg) and not sold})
-    return out
-
-
-def btn_by_text(msg, sub: str) -> Optional[bytes]:
-    """Callback data of the first inline button whose label contains `sub`."""
-    rm = getattr(msg, "reply_markup", None)
-    for row in getattr(rm, "rows", None) or []:
-        for b in getattr(row, "buttons", None) or []:
-            d = getattr(b, "data", None)
-            if d and sub in clean(getattr(b, "text", "")):
-                return d
-    return None
-
-
-def _is_shop(m) -> bool:
-    t = clean(m.raw_text)
-    return "فروشگاه هالووین" in t and "شارژ مجدد" in t
-
-
-class HalEngine:
-    GIFT_KW = "گیفت"
-    ELIXIR_KW = ("آسیب", "اکسیر")
-
-    def __init__(self, uid: int):
-        self.uid = uid
-        self.task: Optional[asyncio.Task] = None
-        self.waiters: List[Tuple[Any, asyncio.Future]] = []
-        self.recent: "collections.deque" = collections.deque(maxlen=30)
-        self.state = "stopped"
-        self.next_at: Optional[float] = None
-
-    @property
-    def cfg(self) -> dict:
-        return hcfg(self.uid)
-
-    @property
-    def client(self) -> Optional[TelegramClient]:
-        return ACCOUNTS.get(self.uid)
-
-    @property
-    def running(self) -> bool:
-        return self.task is not None and not self.task.done()
-
-    def start(self) -> Optional[str]:
-        if self.running:
-            return "Already running."
-        if self.client is None:
-            return "Log in first."
-        if not self.cfg["chat"]:
-            return "No group. Send .activehalloween inside a group."
-        self.recent.clear()
-        self.task = spawn(self._loop(), f"hal-loop-{self.uid}")
-        return None
-
-    def stop(self) -> None:
-        if self.task and not self.task.done():
-            self.task.cancel()
-        for _, f in self.waiters:
-            if not f.done():
-                f.cancel()
-        self.waiters.clear()
-        self.state, self.next_at = "stopped", None
-
-    # --- waiters -----------------------------------------------------------
-    def feed(self, msg) -> None:
-        self.recent.append((time.time(), msg))
-        for item in list(self.waiters):
-            pred, fut = item
-            if fut.done():
-                self.waiters.remove(item)
-                continue
-            try:
-                ok = pred(msg)
-            except Exception:
-                ok = False
-            if ok:
-                self.waiters.remove(item)
-                fut.set_result(msg)
-
-    def expect(self, pred) -> asyncio.Future:
-        fut = asyncio.get_running_loop().create_future()
-        self.waiters.append((pred, fut))
-        return fut
-
-    async def wait(self, fut, timeout: float):
-        try:
-            return await asyncio.wait_for(fut, timeout)
-        except asyncio.TimeoutError:
-            self.waiters = [w for w in self.waiters if w[1] is not fut]
-            return None
-
-    async def tell(self, text: str) -> None:
-        try:
-            await RT.bot.send_message(self.uid, text, parse_mode="md")
-        except Exception:
-            pass
-
-    async def _click(self, msg, data: bytes) -> str:
-        """Press an inline button; returns the toast text the bot answered with (may be '')."""
-        client = self.client
-        if client is None:
-            raise RuntimeError("logged out")
-        peer = await client.get_input_entity(int(self.cfg["chat"]))
-        try:
-            res = await client(GetBotCallbackAnswerRequest(peer=peer, msg_id=msg.id, data=data))
-            return getattr(res, "message", "") or ""
-        except WAIT_ERRORS:
-            raise
-        except Exception as e:
-            if "BotResponseTimeout" in type(e).__name__:
-                return ""
-            raise
-
-    # --- choose + buy + verify ---------------------------------------------
-    def _choose(self, items, panel):
-        """Gift box first; otherwise the damage elixir. Only items that are in stock."""
-        order = [("gift", self.GIFT_KW)] + [("elixir", k) for k in self.ELIXIR_KW]
-        for kind, kw in order:
-            it = next((i for i in items if kw in i["name"] and i["avail"]), None)
-            if it and btn_by_text(panel, kw):
-                return kind, it, kw
-        return None, None, None
-
-    async def _verify(self, item, mark, toast, candy_before):
-        """Purchase counts only if we see proof: candy dropped / item sold out / success text."""
-        deadline = time.time() + 8
-        while True:
-            other = [clean(toast)]
-            newpanel = None
-            for ts, m in list(self.recent):
-                if ts < mark:
-                    continue
-                if _is_shop(m):
-                    newpanel = m
-                else:
-                    other.append(clean(m.raw_text))
-            blob = " ".join(other)
-            if any(w in blob for w in HAL_FAIL_WORDS):
-                return False, "refused: " + blob.strip()[:80], newpanel
-            if newpanel is not None:
-                t = clean(newpanel.raw_text)
-                after = parse_candy(t)
-                if candy_before is not None and after is not None and after < candy_before:
-                    return True, "candy decreased", newpanel
-                it = next((i for i in parse_hal_items(t) if i["n"] == item["n"]), None)
-                if it is not None and item["avail"] and not it["avail"]:
-                    return True, "item now sold out", newpanel
-            if any(w in blob for w in HAL_OK_WORDS):
-                return True, "success message", newpanel
-            if time.time() >= deadline:
-                return False, "no confirmation", newpanel
-            await asyncio.sleep(0.5)
-
-    async def _buy(self, panel, kind, kw, item, candy_before):
-        for _ in (1, 2):
-            data = btn_by_text(panel, kw)
-            if data is None:
-                return False, "button vanished"
-            self.state = f"buying {kind}"
-            mark = time.time()
-            toast = await self._click(panel, data)
-            ok, why, newpanel = await self._verify(item, mark, toast, candy_before)
-            if ok:
-                return True, why
-            if why.startswith("refused"):
-                return False, why
-            if newpanel is not None:
-                panel = newpanel
-            await asyncio.sleep(1)
-        return False, "no confirmation"
-
-    # --- one round ---------------------------------------------------------
-    async def run_round(self):
-        client, c = self.client, self.cfg
-        if client is None:
-            return "stop", "Logged out.", None
-        chat = int(c["chat"])
-        t0 = datetime.now(timezone.utc) - timedelta(seconds=20)
-
-        def fresh(m):
-            return (m.edit_date or m.date) >= t0
-
-        # 1) send the trigger text -> main panel
-        self.state = "opening panel"
-        f1 = self.expect(lambda m: fresh(m) and btn_by_text(m, "فروشگاه") is not None)
-        await tg_call(lambda: client.send_message(chat, c["trigger"]), "hal trigger")
-        m1 = await self.wait(f1, 25)
-        if not m1:
-            return "fail", "no panel after the trigger text", None
-
-        # 2) open the shop -> read the recharge timer
-        self.state = "opening shop"
-        f2 = self.expect(lambda m: fresh(m) and _is_shop(m))
-        await asyncio.sleep(0.8)
-        await self._click(m1, btn_by_text(m1, "فروشگاه"))
-        shop = await self.wait(f2, 15)
-        if not shop:
-            return "fail", "shop panel never appeared", None
-        read_at = time.time()
-
-        secs = parse_hal_timer(shop.raw_text)
-        items = parse_hal_items(shop.raw_text)
-        candy = parse_candy(shop.raw_text)
-        c["runs"] = int(c["runs"]) + 1
-        c["last_candy"] = candy
-
-        # 3) buy gift box (priority) or elixir, verified
-        kind, item, kw = self._choose(items, shop)
-        if kind:
-            ok, why = await self._buy(shop, kind, kw, item, candy)
-            if ok:
-                key = "gifts" if kind == "gift" else "elixirs"
-                c[key] = int(c[key]) + 1
-                c["last"] = f"{kind} ✓ ({why})"
-                if kind == "gift":
-                    await self.tell("🎁 **Gift box bought** ✅ (verified: " + why + ")")
-            else:
-                c["failed"] = int(c["failed"]) + 1
-                c["last"] = f"{kind} ✗ ({why})"
-                await self.tell(f"⚠️ **Halloween:** couldn't confirm the {kind} purchase — `{why}`")
-        else:
-            c["last"] = "nothing to buy"
-        save_config()
-        log_hal.info(f"[{self.uid}] run={c['runs']} timer={secs} candy={candy} last={c['last']}")
-
-        if secs is None:
-            return "fail", "couldn't read the shop timer", None
-        extra = max(float(c.get("extra") or 2.0), 0.0)
-        return "ok", c["last"], max(read_at + secs + extra - time.time(), 5.0)
-
-    async def _loop(self) -> None:
-        fails = 0
-        try:
-            while True:
-                wait: float = 60
-                try:
-                    status, info, nxt = await self.run_round()
-                except asyncio.CancelledError:
-                    raise
-                except FATAL_SEND_ERRORS as e:
-                    record_error("halloween", e)
-                    await self.tell(f"⏹ **Halloween stopped**\n`{_short(e, 150).replace('`', chr(39))}`")
-                    self.cfg["on"] = False
-                    save_config()
-                    return
-                except Exception as e:
-                    record_error("halloween", e)
-                    status, info, nxt = "fail", _short(e, 200), None
-                if status == "stop":
-                    await self.tell(f"⏹ **Halloween stopped**\n{info}")
-                    return
-                if status == "fail":
-                    fails += 1
-                    log_hal.warning(f"[{self.uid}] failed ({fails}/4): {info}")
-                    if fails >= 4:
-                        await self.tell(f"⏹ **Halloween stopped** after 4 failures.\n`{info.replace('`', chr(39))}`")
-                        self.cfg["on"] = False
-                        save_config()
-                        return
-                    wait = min(30 * fails, 180)
-                else:
-                    fails, wait = 0, nxt or 60
-                self.state = f"waiting {fmt_mmss(wait)}"
-                self.next_at = time.time() + wait
-                await asyncio.sleep(wait)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self.state, self.next_at = "stopped", None
-
-
-HAL: Dict[int, HalEngine] = {}
-
-
-def hal_engine(uid: int) -> HalEngine:
-    e = HAL.get(uid)
-    if e is None:
-        e = HAL[uid] = HalEngine(uid)
-    return e
-
-
-@guard("hal-on")
-async def _on_halon(event) -> None:
-    if not event.is_group:
-        return
-    uid = uid_of(event.client)
-    if uid is None:
-        return
-    chat = await event.get_chat()
-    title = getattr(chat, "title", None) or str(event.chat_id)
-    c, e = hcfg(uid), hal_engine(uid)
-    if int(c["chat"] or 0) != int(event.chat_id):
-        e.stop()
-    c.update(chat=int(event.chat_id), title=title, on=True)
-    save_config()
-    err = e.start()
-    await _flash(event, f"🎃 Halloween active in: {title}" if not err else f"⚠️ {err}")
-
-
-@guard("hal-off")
-async def _on_haloff(event) -> None:
-    if not event.is_group:
-        return
-    uid = uid_of(event.client)
-    if uid is None:
-        return
-    hal_engine(uid).stop()
-    hcfg(uid)["on"] = False
-    save_config()
-    await _flash(event, "⏹ Halloween stopped.")
-
-
-@guard("hal-listener", notify=False)
-async def _on_hal_msg(event) -> None:
-    if not event.is_group:
-        return
-    uid = uid_of(event.client)
-    eng = HAL.get(uid) if uid is not None else None
-    if eng is None or not eng.running or event.chat_id != int(eng.cfg["chat"] or 0):
-        return
-    sender = await event.get_sender()
-    if not getattr(sender, "bot", False):
-        return
-    eng.feed(event.message)
-
-
-def hal_view(uid: int, note: str = "") -> Tuple[str, list]:
-    e, c = hal_engine(uid), hcfg(uid)
-    run = e.running
-    left = f" ({fmt_mmss(e.next_at - time.time())})" if run and e.next_at else ""
-    group = c["title"] or "— (send .activehalloween in a group)"
-    candy = c["last_candy"] if c["last_candy"] is not None else "—"
-    text = (
-        "**🎃 Halloween Miyoui**\n\n"
-        f"**Status:** {'▶️ Running' if run else '⏹ Stopped'} — {e.state}{left}\n"
-        f"**Group:** {group}\n"
-        f"**Trigger text:** `{c['trigger']}`\n"
-        f"**Extra wait after timer:** {float(c['extra']):g}s\n\n"
-        f"**Rounds:** {c['runs']}\n"
-        f"**🎁 Gift boxes bought:** {c['gifts']}\n"
-        f"**🧪 Elixirs bought:** {c['elixirs']}\n"
-        f"**⚠️ Unconfirmed:** {c['failed']}\n"
-        f"**🍬 Last candy:** {candy}\n"
-        f"**Last result:** {c['last'] or '—'}"
-    )
-    rows = [
-        [sbtn("⏹ Stop" if run else "▶️ Start", b"hal:stop" if run else b"hal:start",
-              "danger" if run else "success")],
-        [sbtn("✏️ Text", b"hal:set:trigger", "primary"), sbtn("⏱ Extra wait", b"hal:set:extra", "primary")],
-        [Button.inline("🔄 Refresh", b"hal:menu"), sbtn("🗑 Reset counters", b"hal:reset", "danger")],
-        [Button.inline("◀️ Back", b"nav:main")],
-    ]
-    return (f"{note}\n\n{text}" if note else text), rows
-
-
-def hal_apply_input(uid: int, key: str, raw: str) -> Tuple[bool, str]:
-    c = hcfg(uid)
-    if key == "hal_trigger":
-        v = (raw or "").strip()          # keep the text exactly as typed (no normalisation)
-        if not v or len(v) > 50:
-            return False, "Send 1–50 characters."
-        c["trigger"] = v
-        save_config()
-        return True, f"✅ Trigger text = {v}"
-    try:
-        v = float(clean(raw).strip().replace(",", "."))
-    except ValueError:
-        return False, "Send a number."
-    if not 0 <= v <= 30:
-        return False, "Send seconds between 0 and 30."
-    c["extra"] = v
-    save_config()
-    return True, f"✅ Extra wait = {v:g}s"
-
-
-def _only_main(fn):
-    """Legacy MiaoBet/Meow/Captcha/Slot handlers only react on the OWNER's account."""
-    @functools.wraps(fn)
-    async def w(event):
-        if event.client is RT.user:
-            return await fn(event)
-    return w
-
-
 def attach_user_handlers(client: TelegramClient) -> None:
     if getattr(client, "_bet_attached", False):
         return
     client._bet_attached = True
-    A = client.add_event_handler
-    A(_only_main(_on_activate), events.NewMessage(outgoing=True, pattern=GROUP_CMD))
-    A(_only_main(_on_activemeow), events.NewMessage(outgoing=True, pattern=MEOW_ON_CMD))
-    A(_only_main(_on_stopmeow), events.NewMessage(outgoing=True, pattern=MEOW_OFF_CMD))
-    A(_only_main(_on_captcha), events.NewMessage(incoming=True))
-    A(_only_main(_on_slot_post), events.NewMessage(incoming=True))
-    A(_only_main(_on_slot_edit), events.MessageEdited(incoming=True))
-    A(_only_main(_on_game_msg), events.NewMessage(incoming=True))
-    A(_only_main(_on_game_msg), events.MessageEdited(incoming=True))
-    A(_only_main(_on_meow_msg), events.NewMessage(incoming=True))
-    A(_only_main(_on_meow_msg), events.MessageEdited(incoming=True))
-    # Halloween: every account
-    A(_on_halon, events.NewMessage(outgoing=True, pattern=HAL_ON_CMD))
-    A(_on_haloff, events.NewMessage(outgoing=True, pattern=HAL_OFF_CMD))
-    A(_on_hal_msg, events.NewMessage(incoming=True))
-    A(_on_hal_msg, events.MessageEdited(incoming=True))
+    client.add_event_handler(_on_activate, events.NewMessage(outgoing=True, pattern=GROUP_CMD))
+    client.add_event_handler(_on_activemeow, events.NewMessage(outgoing=True, pattern=MEOW_ON_CMD))
+    client.add_event_handler(_on_stopmeow, events.NewMessage(outgoing=True, pattern=MEOW_OFF_CMD))
+    client.add_event_handler(_on_captcha, events.NewMessage(incoming=True))
+    client.add_event_handler(_on_slot_post, events.NewMessage(incoming=True))
+    client.add_event_handler(_on_slot_edit, events.MessageEdited(incoming=True))
+    client.add_event_handler(_on_game_msg, events.NewMessage(incoming=True))
+    client.add_event_handler(_on_game_msg, events.MessageEdited(incoming=True))
+    client.add_event_handler(_on_meow_msg, events.NewMessage(incoming=True))
+    client.add_event_handler(_on_meow_msg, events.MessageEdited(incoming=True))
     log_bet.info("user handlers attached")
 
 
@@ -2216,7 +1909,7 @@ def attach_user_handlers(client: TelegramClient) -> None:
 # 8. PANELS
 # ===========================================================================
 def main_text(uid: int) -> str:
-    logged = "✅" if uid in ACCOUNTS else "❌"
+    logged = "✅" if RT.user else "❌"
     u = db_get_user(uid) or {}
     name = u.get("first_name") or "—"
     phone = u.get("phone") or "—"
@@ -2228,15 +1921,13 @@ def main_text(uid: int) -> str:
     )
 
 
-def main_buttons(uid: int):
+def main_buttons():
     rows = []
-    if uid not in ACCOUNTS:
+    if not RT.user:
         rows.append([sbtn("📷 Login with QR", b"auth:qr", "success")])
         rows.append([sbtn("📱 Login with Phone", b"auth:phone", "success")])
     else:
-        if uid == owner_id() and RT.user:
-            rows.append([sbtn("🎳 MiaoBet", b"nav:bet", "primary")])
-        rows.append([sbtn("🎃 Halloween", b"hal:menu", "primary")])
+        rows.append([sbtn("🎰 MiaoBet", b"nav:bet", "primary")])
         rows.append([sbtn("🚪 Logout", b"auth:logout", "danger")])
     return rows
 
@@ -2254,7 +1945,7 @@ def qr_prompt_text() -> str:
 
 def login_success_text(first_name: str, phone: str) -> str:
     return (
-        f"✅ **Logged in!**\n\n"
+        f"✅ **Logged in via QR!**\n\n"
         f"👤 **{first_name}**\n"
         f"📞 `{phone or '—'}`"
     )
@@ -2263,44 +1954,44 @@ def login_success_text(first_name: str, phone: str) -> str:
 def qr_2fa_text() -> str:
     return (
         "**🔐 2FA Required**\n\n"
-        "Your account has **two-step verification**.\n\n"
+        "QR was scanned, but your account has **two-step verification**.\n\n"
         "Send your **2FA password** now.\n\n"
         "_Message will be deleted immediately._"
     )
 
 
 # --- MiaoBet panels ---------------------------------------------------------
+def _mult_of(row: dict) -> float:
+    try:
+        return float(json.loads(row["dice"] or "[]")[0])
+    except Exception:
+        return 0.0
+
+
 def compute_stats() -> dict:
     rows = db_all_bets()
     s = {
-        "rounds": len(rows), "wins": 0, "losses": 0,
-        "profit": 0, "loss": 0, "odd": 0, "even": 0,
-        "faces": {i: 0 for i in range(1, 7)},
+        "rounds": len(rows), "wins": 0, "losses": 0, "even": 0,
+        "profit": 0, "loss": 0, "mults": {},
         "max_bet": 0, "best_loss_streak": 0, "cur_loss_streak": 0,
         "balance": None,
     }
     cur = 0
     for r in rows:
-        won, net = bool(r["won"]), int(r["net"])
-        if won:
+        net = int(r["net"])
+        if net > 0:
             s["wins"] += 1
-            s["profit"] += max(net, 0)
+            s["profit"] += net
             cur = 0
-        else:
+        elif net < 0:
             s["losses"] += 1
-            s["loss"] += abs(min(net, 0))
+            s["loss"] += -net
             cur += 1
             s["best_loss_streak"] = max(s["best_loss_streak"], cur)
-        if int(r["total"]) % 2:
-            s["odd"] += 1
         else:
             s["even"] += 1
-        try:
-            for d in json.loads(r["dice"] or "[]"):
-                if d in s["faces"]:
-                    s["faces"][d] += 1
-        except Exception:
-            pass
+        m = _mult_of(r)
+        s["mults"][m] = s["mults"].get(m, 0) + 1
         s["max_bet"] = max(s["max_bet"], int(r["amount"]))
         if r["balance"] is not None:
             s["balance"] = int(r["balance"])
@@ -2311,36 +2002,33 @@ def compute_stats() -> dict:
 def stats_text() -> str:
     s = compute_stats()
     if not s["rounds"]:
-        return "**📊 MiaoBet Stats**\n\nNo rounds yet."
+        return "**📊 MiaoBet Stats**\n\nNo slot rounds yet."
     net = s["profit"] - s["loss"]
     wr = s["wins"] * 100 / s["rounds"]
-    faces = "  ".join(f"{k}:{v}" for k, v in s["faces"].items())
+    mults = "  ".join(f"{k:g}x:{v}" for k, v in sorted(s["mults"].items()))
     bal = f"{s['balance']:,}" if s["balance"] is not None else "—"
     return (
-        "**📊 MiaoBet Stats**\n\n"
-        f"**Rounds:** {s['rounds']}  (✅ {s['wins']} / ❌ {s['losses']} · {wr:.1f}%)\n"
+        "**📊 MiaoBet Stats (slots)**\n\n"
+        f"**Rounds:** {s['rounds']}  (✅ {s['wins']} / ❌ {s['losses']} / ➖ {s['even']} · {wr:.1f}% won)\n"
         f"**Profit:** +{s['profit']:,}\n"
         f"**Loss:** -{s['loss']:,}\n"
         f"**Net:** {'+' if net >= 0 else ''}{net:,}\n"
         f"**Balance:** {bal}\n\n"
-        f"**Totals:** odd {s['odd']} · even {s['even']}\n"
-        f"**Dice faces:** `{faces}`\n\n"
+        f"**Results:** `{mults}`\n\n"
         f"**Loss streak:** now {s['cur_loss_streak']} · worst {s['best_loss_streak']}\n"
         f"**Highest bet:** {fmt_k(s['max_bet'])}"
     )
 
 
 FORECAST_HOURS = (1, 6, 12, 24)
+FORECAST_MIN_ROUNDS = 10
 
 
 def forecast_params() -> dict:
-    """Learn win rate / payout / round speed / pace from the bet history."""
+    """Learn the multiplier distribution / round speed / pace from the slot history."""
     rows = db_all_bets()
     n = len(rows)
-    wins = sum(1 for r in rows if r["won"])
-    p = (wins + 10) / (n + 20)  # shrink towards 50% while data is thin
-    ratios = [r["net"] / r["amount"] for r in rows if r["won"] and r["amount"] and r["net"] > 0]
-    ratio = sum(ratios) / len(ratios) if ratios else 1.0
+    mults = [_mult_of(r) for r in rows]
     ts = []
     for r in rows:
         try:
@@ -2356,13 +2044,11 @@ def forecast_params() -> dict:
         hrs = (ts[-1] - ts[0]).total_seconds() / 3600
         if hrs >= 0.05:
             pace = sum(int(r["net"]) for r in rows) / hrs
-    balance = None
-    if rows and rows[-1]["balance"] is not None:
+    balance = RT.engine.last_balance if RT.engine else None
+    if balance is None and rows and rows[-1]["balance"] is not None:
         balance = int(rows[-1]["balance"])
-    elif RT.engine and RT.engine.last_balance is not None:
-        balance = RT.engine.last_balance
     return {
-        "rounds": n, "p": p, "raw_wr": (wins / n if n else None), "ratio": ratio,
+        "rounds": n, "mults": mults,
         "period": period, "pace": pace, "balance": balance,
         "base": max(int(CONFIG.get("bet_base") or MIN_BET), MIN_BET),
         "mult": float(CONFIG.get("bet_mult") or 3),
@@ -2373,13 +2059,15 @@ def forecast_params() -> dict:
 
 
 def simulate_forecast(par: dict, runs: int = 1000) -> dict:
-    """Monte-Carlo of the real martingale ladder (incl. all-in). Returns per-horizon stats."""
+    """Monte-Carlo of the real slot ladder: results are drawn from YOUR observed multipliers."""
+    if len(par["mults"]) < FORECAST_MIN_ROUNDS:
+        return {}
     marks: Dict[int, List[int]] = {}
     for h in FORECAST_HOURS:
         marks.setdefault(max(int(h * 3600 / par["period"]), 1), []).append(h)
     max_r = max(marks)
     out = {h: {"profit": [], "stopped": 0} for h in FORECAST_HOURS}
-    p, ratio, base, mult = par["p"], par["ratio"], par["base"], par["mult"]
+    mults, base, factor = par["mults"], par["base"], par["mult"]
     cap, bal0, allin = par["cap"], par["balance"], par.get("allin", True)
     for _ in range(runs):
         prof, bet, dead = 0.0, par["bet"], False
@@ -2390,12 +2078,10 @@ def simulate_forecast(par: dict, runs: int = 1000) -> dict:
                     bet = int(avail)
                 if (cap and bet > cap) or (avail is not None and bet > avail):
                     dead = True
-                elif random.random() < p:
-                    prof += bet * ratio
-                    bet = base
                 else:
-                    prof -= bet
-                    bet = int(round(bet * mult))
+                    m = random.choice(mults)
+                    prof += bet * m - bet
+                    bet, _kind = next_stake(m, bet, base, factor)
             if r in marks:
                 for h in marks[r]:
                     out[h]["profit"].append(prof)
@@ -2418,18 +2104,25 @@ def _sk(n: float) -> str:
 
 
 def forecast_text(par: dict, sim: dict) -> str:
-    wr = f"{par['raw_wr'] * 100:.0f}%" if par["raw_wr"] is not None else "—"
+    if not sim:
+        return (
+            "**🔮 Forecast**\n\n"
+            f"Only {par['rounds']} slot rounds so far — I need at least {FORECAST_MIN_ROUNDS} "
+            "to replay your own results. Run the bot a bit longer and come back."
+        )
+    ms = par["mults"]
+    avg = sum(ms) / len(ms)
     lines = [
         "**🔮 Forecast** (simulation, 1000 runs)\n",
-        f"**Based on:** {par['rounds']} rounds · win rate {wr} (used {par['p'] * 100:.0f}%) · "
-        f"≈{par['period']:.0f}s per round · payout ×{par['ratio']:.2f}",
-        f"**Ladder:** base {fmt_k(par['base'])} · ×{par['mult']:g} · next {fmt_k(par['bet'])}"
+        f"**Based on:** {par['rounds']} rounds · average payout ×{avg:.2f} per bet · "
+        f"≈{par['period']:.0f}s per round",
+        f"**Ladder:** base {fmt_k(par['base'])} · ×{par['mult']:g} after 0x/0.5x · next {fmt_k(par['bet'])}"
         + (f" · max {fmt_k(par['cap'])}" if par["cap"] else "")
         + (" · all-in ON" if par.get("allin") else ""),
     ]
     if par["balance"] is not None:
         lines.append(f"**Balance now:** {par['balance']:,}")
-    if par["rounds"] < 30:
+    if par["rounds"] < 50:
         lines.append("_Few rounds so far — treat this as a rough guess._")
     lines.append("")
     for h in FORECAST_HOURS:
@@ -2450,8 +2143,8 @@ def forecast_text(par: dict, sim: dict) -> str:
         )
     lines.append(
         "\n_This replays your own results through the bet ladder — it is not a prediction "
-        "of the dice. With a ×3 ladder most runs look fine while a few lose big, so watch the "
-        "low end of the range and the stop %._"
+        "of the slot. A ×3 ladder after every 0x/0.5x grows fast, so watch the low end of "
+        "the range and the stop %._"
     )
     return "\n".join(lines)
 
@@ -2470,13 +2163,12 @@ def bet_view(note: str = "") -> Tuple[str, list]:
     left = ""
     if run and eng.next_run_at:
         left = f" ({max(int(eng.next_run_at - time.time()), 0)}s)"
-    choice = "Odd" if CONFIG["bet_choice"] == "odd" else "Even"
     text = (
-        "**🎳 MiaoBet — Bowling**\n\n"
+        "**🎰 MiaoBet — Slots**\n\n"
         f"**Status:** {'▶️ Running' if run else '⏹ Stopped'} — {eng.state}{left}\n"
         f"**Group:** {gtitle}\n"
         f"**Next bet:** {fmt_k(eng.current_bet())}\n"
-        f"**Setup:** {choice} · base {fmt_k(CONFIG['bet_base'])} · ×{float(CONFIG['bet_mult']):g}"
+        f"**Setup:** base {fmt_k(CONFIG['bet_base'])} · ×{float(CONFIG['bet_mult']):g} on 0x/0.5x"
         f" · all-in {'ON' if CONFIG.get('bet_allin', True) else 'OFF'}\n"
         f"**Meow:** {'▶️ Running' if mt.running else '⏹ Stopped'}"
     )
@@ -2486,7 +2178,7 @@ def bet_view(note: str = "") -> Tuple[str, list]:
               "danger" if run else "success")],
         [sbtn("🎮 Game", b"bet:menu:game", "primary"),
          sbtn("🧮 Captcha", b"bet:menu:cap", "primary"),
-         sbtn("🎰 Slots", b"bet:menu:slot", "primary")],
+         sbtn("🎰 Challenge", b"bet:menu:slot", "primary")],
         [sbtn("🐾 Meow", b"bet:menu:meow", "primary"),
          sbtn("👥 Groups", b"bet:groups", "primary"),
          sbtn("📊 Status", b"bet:stats", "primary")],
@@ -2498,24 +2190,22 @@ def bet_view(note: str = "") -> Tuple[str, list]:
 
 
 def game_view(note: str = "") -> Tuple[str, list]:
-    """Game settings: choice, base, multiplier, max bet, wait, all-in."""
-    choice = CONFIG["bet_choice"]
+    """Game settings: base, multiplier, max bet, wait, all-in."""
     mx = int(CONFIG.get("bet_max") or 0)
     allin = bool(CONFIG.get("bet_allin", True))
     text = (
-        "**🎮 Game settings**\n\n"
-        f"**Choice:** {'Odd (فرد)' if choice == 'odd' else 'Even (زوج)'}\n"
+        "**🎮 Game settings (slots)**\n\n"
         f"**Base bet:** {fmt_k(CONFIG['bet_base'])}  (min {fmt_k(MIN_BET)})\n"
-        f"**Multiplier after a loss:** ×{float(CONFIG['bet_mult']):g}\n"
+        f"**Ladder:** 1x → same bet · 1.5x / 2x / 2.5x / 3x … → back to base · "
+        f"0.5x / 0x → ×{float(CONFIG['bet_mult']):g}\n"
         f"**Max bet:** {fmt_k(mx) if mx else 'off'}\n"
-        f"**All-in:** {'✅ ON — if the next bet is more than your balance, bet the whole balance' if allin else '⛔ OFF — stop instead'}\n"
-        f"**Wait after each result:** {CONFIG['bet_cooldown']}s\n"
+        f"**All-in:** {'✅ ON — if the next bet is more than your balance (when the bot shows it), bet the whole balance' if allin else '⛔ OFF — stop instead'}\n"
+        f"**Wait after each result:** {CONFIG['bet_cooldown']}s  (the bot needs {SLOT_GAP}s)\n"
         f"**Delay between steps:** {float(CONFIG.get('bet_delay') or 1):g}s"
     )
     rows = [
-        [sbtn(f"🎯 {'Odd' if choice == 'odd' else 'Even'} → tap to switch", b"bet:choice", "primary")],
         [sbtn(f"💰 Base: {fmt_k(CONFIG['bet_base'])}", b"bet:set:base", "success"),
-         sbtn(f"✖️ Multiplier: ×{float(CONFIG['bet_mult']):g}", b"bet:set:mult", "success")],
+         sbtn(f"✖️ ×{float(CONFIG['bet_mult']):g} on 0x/0.5x", b"bet:set:mult", "success")],
         [sbtn(f"🛑 Max bet: {fmt_k(mx) if mx else 'off'}", b"bet:set:max", "danger"),
          sbtn(f"⏱ Wait: {CONFIG['bet_cooldown']}s", b"bet:set:cd", "primary")],
         [sbtn(f"🔥 All-in: {'ON' if allin else 'OFF'}", b"bet:allin", "success" if allin else "danger")],
@@ -2525,25 +2215,39 @@ def game_view(note: str = "") -> Tuple[str, list]:
 
 
 def captcha_view(note: str = "") -> Tuple[str, list]:
-    """Captcha solver settings."""
+    """Captcha solver settings + one toggle button per detected game group."""
     on = bool(CONFIG.get("captcha_on", True))
     allg = bool(CONFIG.get("captcha_all", True))
+    groups = db_cap_list()
+    n_on = sum(1 for g in groups if g["enabled"])
     text = (
         "**🧮 Captcha solver**\n\n"
         f"**Status:** {'✅ ON' if on else '⛔ OFF'}\n"
-        f"**Where:** {'every group you are in' if allg else 'active group only'}\n"
-        f"**Solved so far:** {int(CONFIG.get('captcha_solved') or 0)}"
+        f"**Unknown groups:** {'answered too (All groups)' if allg else 'ignored (Selected only)'}\n"
+        f"**Solved so far:** {int(CONFIG.get('captcha_solved') or 0)}\n\n"
+        f"**Game groups:** {len(groups)} found · {n_on} ON\n"
+        + ("_Tap a group to switch its captcha ON ✅ / OFF ⬜._" if groups
+           else "_No groups yet — tap 🔍 Detect groups. The first captcha the game bot sends "
+                "in a new group also adds it automatically._")
     )
     rows = [
         [sbtn(f"🧮 Captcha: {'ON' if on else 'OFF'}", b"bet:captcha", "success" if on else "danger")],
-        [sbtn("🌐 All groups" if allg else "🎯 Active group only", b"bet:captchascope", "primary")],
-        [Button.inline("◀️ Back", b"nav:bet")],
+        [sbtn("🔍 Detect groups", b"bet:cap:scan", "primary"),
+         sbtn("🌐 All groups" if allg else "☑️ Selected only", b"bet:captchascope", "primary")],
     ]
+    for g in groups[:24]:
+        title = (g["title"] or str(g["chat_id"]))[:28]
+        rows.append([sbtn(f"{'✅' if g['enabled'] else '⬜'} {title}",
+                          f"bet:cap:tog:{g['chat_id']}".encode(),
+                          "success" if g["enabled"] else "danger")])
+    if len(groups) > 24:
+        text += f"\n\n_Showing the first 24 of {len(groups)} groups._"
+    rows.append([Button.inline("◀️ Back", b"nav:bet")])
     return _with_note(text, note), rows
 
 
 def slot_view(note: str = "") -> Tuple[str, list]:
-    """Slot challenge settings."""
+    """Slot challenge (channel) settings."""
     on = bool(CONFIG.get("slot_on", True))
     text = (
         "**🎰 Slot challenge**\n\n"
@@ -2557,7 +2261,7 @@ def slot_view(note: str = "") -> Tuple[str, list]:
         f"**Wins:** {int(CONFIG.get('slot_wins') or 0)}"
     )
     rows = [
-        [sbtn(f"🎰 Slots: {'ON' if on else 'OFF'}", b"bet:slot", "success" if on else "danger")],
+        [sbtn(f"🎰 Challenge: {'ON' if on else 'OFF'}", b"bet:slot", "success" if on else "danger")],
         [sbtn(f"⏱ Interval: {float(CONFIG.get('slot_interval') or 1):g}s", b"bet:set:slot_iv", "primary"),
          sbtn(f"🔢 Max: {int(CONFIG.get('slot_max') or 300)}", b"bet:set:slot_max", "primary")],
         [Button.inline("◀️ Back", b"nav:bet")],
@@ -2637,7 +2341,7 @@ def groups_view() -> Tuple[str, list]:
 
 INPUT_PROMPTS = {
     "base": f"💰 Send the **base bet** (min {fmt_k(MIN_BET)}), e.g. `20k` or `50000`.",
-    "mult": "✖️ Send the **multiplier** after a loss, e.g. `3` (min 1.1).",
+    "mult": "✖️ Send the **multiplier** used after a 0x / 0.5x result, e.g. `3` (min 1.1).",
     "cd": "⏱ Send the **wait time in seconds** after each result, e.g. `61`.",
     "slot_iv": "⏱ Send the **seconds between slot throws**, e.g. `1` (min 0.5).",
     "slot_max": "🔢 Send the **max throws per challenge**, e.g. `300`.",
@@ -2783,98 +2487,8 @@ async def _send_qr(uid: int, url: str):
 
 
 # ===========================================================================
-# 10. LOGIN (QR + phone)
+# 10. QR LOGIN FLOW
 # ===========================================================================
-async def get_login_client(uid: int) -> TelegramClient:
-    """Connected client for this user: the authorized one, or a pending one used for login."""
-    c = ACCOUNTS.get(uid) or PENDING.get(uid)
-    if c is None:
-        c = _make_user_client(uid)
-        PENDING[uid] = c
-    if not c.is_connected():
-        await c.connect()
-    attach_user_handlers(c)
-    return c
-
-
-def _register_account(uid: int, client: TelegramClient) -> None:
-    ACCOUNTS[uid] = client
-    PENDING.pop(uid, None)
-    save_session(uid, client)
-    if not CONFIG["owner_id"]:
-        CONFIG["owner_id"] = uid
-        save_config()
-    if uid == owner_id():
-        RT.user = client
-    attach_user_handlers(client)
-
-
-async def adopt_if_authorized(uid: int, client: TelegramClient, event=None) -> bool:
-    """If this client is already logged in, just use it (never get stuck on 'login')."""
-    try:
-        if not await client.is_user_authorized():
-            return False
-        me = await client.get_me()
-    except Exception as e:
-        log_bot.warning(f"is_user_authorized failed: {e}")
-        return False
-    _register_account(uid, client)
-    ensure_user(uid, username=me.username or "", first_name=me.first_name or "", phone=me.phone or "")
-    text = f"✅ Already logged in as **{me.first_name}**."
-    try:
-        if event is not None:
-            await event.respond(text, buttons=main_buttons(uid), parse_mode="md")
-        elif RT.bot:
-            await RT.bot.send_message(uid, text, buttons=main_buttons(uid), parse_mode="md")
-    except Exception:
-        pass
-    return True
-
-
-async def reset_login_state(uid: int) -> None:
-    """Forget every half-finished login step for this user (called on /start, cancel...)."""
-    RT.phone_flow.pop(uid, None)
-    RT.set_2fa(uid, False)
-    RT.twofa_tries.pop(uid, None)
-    RT.await_input.pop(uid, None)
-    t = RT.qr_wait_tasks.pop(uid, None)
-    if t and not t.done():
-        t.cancel()
-
-
-TWOFA_BUTTONS = [[Button.inline("✖️ Cancel", b"auth:cancel")]]
-
-
-async def _finish_login(uid: int) -> None:
-    """Common post-login steps (QR scan, phone code or 2FA)."""
-    client = PENDING.get(uid) or ACCOUNTS.get(uid)
-    if client is None:
-        raise RuntimeError("no client to finish login with")
-    me = await client.get_me()
-    RT.phone_flow.pop(uid, None)
-    RT.twofa_tries.pop(uid, None)
-    RT.set_2fa(uid, False)
-    ensure_user(
-        uid,
-        username=me.username or "",
-        first_name=me.first_name or "",
-        phone=me.phone or "",
-    )
-    # the person chatting with this bot is the owner if nobody claimed it yet
-    _register_account(uid, client)
-    await RT.bot.send_message(
-        uid,
-        login_success_text(me.first_name or "User", me.phone or ""),
-        buttons=main_buttons(uid),
-        parse_mode="md",
-    )
-    log_bot.info(f"user {uid} logged in as {me.first_name}")
-    if uid == owner_id() and CONFIG.get("meow_on") and CONFIG.get("meow_chat"):
-        RT.meow.start()
-    if hcfg(uid)["on"] and hcfg(uid)["chat"]:
-        hal_engine(uid).start()
-
-
 async def _handle_qr_login(event, uid: int) -> None:
     if not HAS_QRCODE:
         await event.respond(
@@ -2889,7 +2503,7 @@ async def _handle_qr_login(event, uid: int) -> None:
 
     RT.phone_flow.pop(uid, None)
     try:
-        client = await get_login_client(uid)
+        client = await get_login_client()
     except Exception as e:
         record_error("qr-client", e)
         await event.respond(f"❌ Client error: `{_short(e, 200).replace('`', chr(39))}`")
@@ -2916,6 +2530,94 @@ async def _handle_qr_login(event, uid: int) -> None:
         return
 
     RT.qr_wait_tasks[uid] = spawn(_qr_wait_task(uid, qr, first), f"qr-wait-{uid}")
+
+
+# --- login client helpers ----------------------------------------------------
+async def get_login_client() -> TelegramClient:
+    """Connected client used for QR/phone login. Authorized clients live in RT.user."""
+    if RT.user is not None:
+        return RT.user
+    c = RT.login_client
+    if c is None:
+        c = _make_user_client()
+        RT.login_client = c
+    if not c.is_connected():
+        await c.connect()
+    attach_user_handlers(c)
+    return c
+
+
+async def adopt_if_authorized(uid: int, client: TelegramClient, event=None) -> bool:
+    """If the session file is already logged in, just use it (never get stuck on 'login')."""
+    try:
+        if not await client.is_user_authorized():
+            return False
+        me = await client.get_me()
+    except Exception as e:
+        log_bot.warning(f"is_user_authorized failed: {e}")
+        return False
+    RT.user = client
+    if RT.login_client is client:
+        RT.login_client = None
+    ensure_user(uid, username=me.username or "", first_name=me.first_name or "", phone=me.phone or "")
+    attach_user_handlers(client)
+    text = f"✅ Already logged in as **{me.first_name}**."
+    try:
+        if event is not None:
+            await event.respond(text, buttons=main_buttons(), parse_mode="md")
+        elif RT.bot:
+            await RT.bot.send_message(uid, text, buttons=main_buttons(), parse_mode="md")
+    except Exception:
+        pass
+    return True
+
+
+async def reset_login_state(uid: int) -> None:
+    """Forget every half-finished login step for this user (called on /start, cancel...)."""
+    RT.phone_flow.pop(uid, None)
+    RT.set_2fa(uid, False)
+    RT.twofa_tries.pop(uid, None)
+    RT.await_input.pop(uid, None)
+    t = RT.qr_wait_tasks.pop(uid, None)
+    if t and not t.done():
+        t.cancel()
+
+
+TWOFA_BUTTONS = [[Button.inline("✖️ Cancel", b"auth:cancel")]]
+
+
+async def _finish_login(uid: int) -> None:
+    """Common post-login steps (QR scan, phone code or 2FA)."""
+    client = RT.login_client or RT.user
+    if client is None:
+        raise RuntimeError("no client to finish login with")
+    me = await client.get_me()
+    RT.user = client
+    if RT.login_client is client:
+        RT.login_client = None
+    RT.phone_flow.pop(uid, None)
+    RT.twofa_tries.pop(uid, None)
+    RT.set_2fa(uid, False)
+    ensure_user(
+        uid,
+        username=me.username or "",
+        first_name=me.first_name or "",
+        phone=me.phone or "",
+    )
+    # the person chatting with this bot is the owner (NOT necessarily the logged-in account)
+    if not CONFIG["owner_id"]:
+        CONFIG["owner_id"] = uid
+        save_config()
+    attach_user_handlers(client)
+    await RT.bot.send_message(
+        uid,
+        login_success_text(me.first_name or "User", me.phone or ""),
+        buttons=main_buttons(),
+        parse_mode="md",
+    )
+    log_bot.info(f"user {uid} logged in as {me.first_name}")
+    if CONFIG.get("meow_on") and CONFIG.get("meow_chat"):
+        RT.meow.start()
 
 
 # --- phone login --------------------------------------------------------------
@@ -3019,10 +2721,10 @@ async def phone_end(uid: int, text: str) -> None:
 async def phone_start(event, uid: int, edit) -> None:
     await reset_login_state(uid)
     try:
-        client = await get_login_client(uid)
+        client = await get_login_client()
     except Exception as e:
         record_error("phone-client", e)
-        await edit(event, f"❌ Client error: `{_short(e, 200).replace('`', chr(39))}`", main_buttons(uid))
+        await edit(event, f"❌ Client error: `{_short(e, 200).replace('`', chr(39))}`", main_buttons())
         return
     if await adopt_if_authorized(uid, client, event):
         return
@@ -3150,7 +2852,7 @@ async def phone_submit_code(uid: int, f: dict, event=None) -> None:
 async def route_phone_cb(event, data: str, uid: int, edit) -> None:
     f = flow_get(uid)
     if not f or f.get("step") != "code":
-        await edit(event, "⌛ This login attempt expired.\n\n" + main_text(uid), main_buttons(uid))
+        await edit(event, "⌛ This login attempt expired.\n\n" + main_text(uid), main_buttons())
         return
     if f.get("busy"):
         return
@@ -3263,32 +2965,37 @@ async def _qr_wait_task(uid: int, qr, last_msg) -> None:
 # 11. HANDLERS
 # ===========================================================================
 async def do_logout(uid: int) -> None:
-    hal_engine(uid).stop()
-    hcfg(uid)["on"] = False
-    save_config()
-    t = RT.qr_wait_tasks.pop(uid, None)
-    if t and not t.done():
-        t.cancel()
-    c = ACCOUNTS.pop(uid, None) or PENDING.pop(uid, None)
-    PENDING.pop(uid, None)
-    if c is not None and c is RT.user:
-        RT.engine.stop()
-        RT.meow.stop()
-        slot_stop()
-        RT.user = None
-    if c is not None:
+    RT.engine.stop()
+    RT.meow.stop()
+    slot_stop()
+    task = RT.qr_wait_tasks.pop(uid, None)
+    if task and not task.done():
+        task.cancel()
+    if RT.user:
         try:
-            await c.log_out()
+            await RT.user.log_out()
         except Exception:
             pass
         try:
-            await c.disconnect()
+            await RT.user.disconnect()
         except Exception:
             pass
-    drop_session(uid)
+    RT.user = None
+    try:
+        f = DB_DIR / "user.session"
+        if f.exists():
+            f.unlink()
+    except Exception:
+        pass
     RT.set_2fa(uid, False)
     RT.phone_flow.pop(uid, None)
     RT.twofa_tries.pop(uid, None)
+    lc, RT.login_client = RT.login_client, None
+    if lc is not None:
+        try:
+            await lc.disconnect()
+        except Exception:
+            pass
 
 
 def register_handlers(bot: TelegramClient) -> None:
@@ -3343,7 +3050,7 @@ def register_handlers(bot: TelegramClient) -> None:
             username=getattr(me, "username", "") or "",
             first_name=getattr(me, "first_name", "") or "",
         )
-        await event.respond(main_text(uid), buttons=main_buttons(uid), parse_mode="md")
+        await event.respond(main_text(uid), buttons=main_buttons(), parse_mode="md")
 
     @bot.on(events.NewMessage(pattern=r"^/logout$"))
     @guarded
@@ -3354,15 +3061,14 @@ def register_handlers(bot: TelegramClient) -> None:
         await do_logout(uid)
         await event.respond(
             "✅ Logged out. Session deleted.",
-            buttons=main_buttons(uid),
+            buttons=main_buttons(),
             parse_mode="md",
         )
 
     @bot.on(events.NewMessage(pattern=r"^/errors$"))
     @guarded
     async def _errors(event):
-        # error log is for the bot owner only
-        if event.sender_id != owner_id():
+        if not is_owner(event.sender_id):
             return
         text, btns = errors_view()
         await event.respond(text, buttons=btns, parse_mode="md")
@@ -3416,7 +3122,7 @@ def register_handlers(bot: TelegramClient) -> None:
         # --- 2FA password (QR or phone login) -------------------------------
         if RT.is_2fa(uid):
             await _tidy(event)
-            client = PENDING.get(uid) or ACCOUNTS.get(uid)
+            client = RT.login_client or RT.user
             if not client:
                 RT.set_2fa(uid, False)
                 await event.respond("❌ Session expired. Try /start again.")
@@ -3433,19 +3139,19 @@ def register_handlers(bot: TelegramClient) -> None:
                 RT.set_2fa(uid, False)
                 RT.twofa_tries.pop(uid, None)
                 await event.respond("❌ Too many wrong passwords. Start the login again.",
-                                    buttons=main_buttons(uid))
+                                    buttons=main_buttons())
                 return
             except WAIT_ERRORS as e:
                 RT.set_2fa(uid, False)
                 await event.respond(f"⏳ Too many attempts. Wait {fmt_mmss(getattr(e, 'seconds', 60))}.",
-                                    buttons=main_buttons(uid))
+                                    buttons=main_buttons())
                 return
             except Exception as e:
                 record_error("2fa", e)
                 RT.set_2fa(uid, False)
                 await event.respond(
                     f"❌ 2FA failed: `{_short(e, 200).replace('`', chr(39))}`",
-                    buttons=main_buttons(uid), parse_mode="md",
+                    buttons=main_buttons(), parse_mode="md",
                 )
                 return
             try:
@@ -3454,23 +3160,10 @@ def register_handlers(bot: TelegramClient) -> None:
                 record_error("finish-2fa", e)
             return
 
-        # --- Halloween settings input ---------------------------------------
-        hk = RT.await_input.get(uid)
-        if hk in ("hal_trigger", "hal_extra") and not (event.raw_text or "").startswith("/"):
-            ok, msg = hal_apply_input(uid, hk, event.raw_text or "")
-            if ok:
-                RT.await_input.pop(uid, None)
-                text, btns = hal_view(uid, msg)
-                await event.respond(text, buttons=btns, parse_mode="md")
-            else:
-                await event.respond(f"❌ {msg} Try again.",
-                                    buttons=[[Button.inline("◀️ Cancel", b"hal:menu")]])
-            return
-
         # settings input (base / multiplier / wait / max / meow ...)
         key = RT.await_input.get(uid)
         raw = event.raw_text or ""
-        if key and uid == owner_id() and not raw.startswith("/"):
+        if key and is_owner(uid) and not raw.startswith("/"):
             ok, msg = apply_input(key, raw)
             if ok:
                 RT.await_input.pop(uid, None)
@@ -3521,7 +3214,7 @@ async def route_cb(event, data: str, edit):
         if not is_owner(uid):
             return
         await reset_login_state(uid)
-        await edit(event, main_text(uid), main_buttons(uid))
+        await edit(event, main_text(uid), main_buttons())
         return
 
     if data.startswith("ph:"):
@@ -3534,59 +3227,19 @@ async def route_cb(event, data: str, edit):
         if not is_owner(uid):
             return
         await do_logout(uid)
-        await edit(event, "✅ Logged out. Session deleted.", main_buttons(uid))
+        await edit(event, "✅ Logged out. Session deleted.", main_buttons())
         return
 
     if data == "nav:main":
         if not is_owner(uid):
             return
         RT.await_input.pop(uid, None)
-        await edit(event, main_text(uid), main_buttons(uid))
+        await edit(event, main_text(uid), main_buttons())
         return
 
-    # ---------------- Halloween (any logged-in user) ----------------
-    if data.startswith("hal:"):
-        if uid not in ACCOUNTS:
-            return
-        e = hal_engine(uid)
-        if data == "hal:menu":
-            RT.await_input.pop(uid, None)
-            text, btns = hal_view(uid)
-        elif data == "hal:start":
-            hcfg(uid)["on"] = True
-            err = e.start()
-            if err:
-                hcfg(uid)["on"] = False
-            save_config()
-            text, btns = hal_view(uid, f"⚠️ {err}" if err else "▶️ Started.")
-        elif data == "hal:stop":
-            e.stop()
-            hcfg(uid)["on"] = False
-            save_config()
-            text, btns = hal_view(uid, "⏹ Stopped.")
-        elif data == "hal:reset":
-            c = hcfg(uid)
-            c.update(runs=0, gifts=0, elixirs=0, failed=0, last="", last_candy=None)
-            save_config()
-            text, btns = hal_view(uid, "🗑 Counters reset.")
-        elif data.startswith("hal:set:"):
-            k = "hal_" + data.split(":")[2]
-            if k not in ("hal_trigger", "hal_extra"):
-                return
-            RT.await_input[uid] = k
-            prompt = ("✏️ Send the **text** that opens the Halloween panel."
-                      if k == "hal_trigger" else
-                      "⏱ Send the **extra seconds** after the shop timer ends (0–30), e.g. `2`.")
-            await edit(event, prompt, [[Button.inline("◀️ Cancel", b"hal:menu")]])
-            return
-        else:
-            return
-        await edit(event, text, btns)
-        return
-
-    # ---------------- MiaoBet (owner account only) ----------------
+    # ---------------- MiaoBet ----------------
     if data == "nav:bet" or data.startswith("bet:"):
-        if uid != owner_id() or RT.user is None:
+        if not is_owner(uid) or RT.user is None:
             return
         eng = RT.engine
         mt = RT.meow
@@ -3639,6 +3292,32 @@ async def route_cb(event, data: str, edit):
 
         if data == "bet:menu:cap":
             text, btns = captcha_view()
+            await edit(event, text, btns)
+            return
+
+        if data == "bet:cap:scan":
+            if RT.scanning:
+                text, btns = captcha_view(note="⏳ A scan is already running.")
+                await edit(event, text, btns)
+                return
+            RT.scanning = True
+            try:
+                await edit(event, "**🔍 Looking for the game bot in your groups…**\n"
+                                  "_This can take a minute if you are in many groups._")
+                checked, found, new = await scan_game_groups()
+            finally:
+                RT.scanning = False
+            text, btns = captcha_view(
+                note=f"🔍 Checked {checked} groups — the game bot is in {found} ({new} new)."
+            )
+            await edit(event, text, btns)
+            return
+
+        if data.startswith("bet:cap:tog:"):
+            state = db_cap_toggle(int(data.split(":")[3]))
+            note = "" if state is None else ("✅ Captcha ON for that group." if state
+                                             else "⬜ Captcha OFF for that group.")
+            text, btns = captcha_view(note=note)
             await edit(event, text, btns)
             return
 
@@ -3713,13 +3392,6 @@ async def route_cb(event, data: str, edit):
             await edit(event, text, btns)
             return
 
-        if data == "bet:choice":
-            CONFIG["bet_choice"] = "even" if CONFIG["bet_choice"] == "odd" else "odd"
-            save_config()
-            text, btns = game_view()
-            await edit(event, text, btns)
-            return
-
         if data.startswith("bet:set:"):
             key = data.split(":")[2]
             if key in INPUT_PROMPTS:
@@ -3788,25 +3460,14 @@ async def _watchdog() -> None:
         try:
             for u_ in list(RT.phone_flow):
                 flow_get(u_)  # drops expired login attempts
-            clients = [("bot", RT.bot)] \
-                + [(f"user{u}", c) for u, c in ACCOUNTS.items()] \
-                + [(f"login{u}", c) for u, c in PENDING.items()]
-            for name, c in clients:
+            for name, c in (("user", RT.user), ("bot", RT.bot), ("login", RT.login_client)):
                 if c is not None and not c.is_connected():
-                    log.warning(f"watchdog: {name} disconnected — reconnecting")
+                    log.warning(f"watchdog: {name} client disconnected — reconnecting")
                     await c.connect()
             if RT.user is not None:
                 if CONFIG.get("meow_on") and CONFIG.get("meow_chat") and not RT.meow.running:
                     log_meow.warning("watchdog: meow loop was not running — restarting")
                     RT.meow.start()
-            for uid_, cfg_ in list(CONFIG.get("hal", {}).items()):
-                try:
-                    u = int(uid_)
-                except ValueError:
-                    continue
-                if cfg_.get("on") and cfg_.get("chat") and u in ACCOUNTS and not hal_engine(u).running:
-                    log_hal.warning(f"watchdog: halloween loop of {u} was not running — restarting")
-                    hal_engine(u).start()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3861,48 +3522,33 @@ async def boot_bot() -> None:
 
     register_handlers(RT.bot)
 
-    # old sqlite user.session -> StringSession file (once)
-    await migrate_old_session()
-
-    # load every saved account
-    for p in sorted(SESS_DIR.glob("*.txt")):
+    # Auto-load existing user session if present
+    if (DB_DIR / "user.session").exists():
         try:
-            uid = int(p.stem)
-        except ValueError:
-            continue
-        c = _make_user_client(uid)
-        try:
-            await c.connect()
-            if not await c.is_user_authorized():
-                log_bot.warning(f"session {uid} not authorized — removed")
-                await c.disconnect()
-                drop_session(uid)
-                continue
-            me2 = await c.get_me()
-            ACCOUNTS[uid] = c
-            ensure_user(uid, username=me2.username or "", first_name=me2.first_name or "",
-                        phone=me2.phone or "")
-            attach_user_handlers(c)
-            log_bot.info(f"session loaded: {me2.first_name} (uid={uid})")
-            if uid == owner_id() or (not owner_id() and RT.user is None):
+            RT.user = _make_user_client()
+            await RT.user.connect()
+            if await RT.user.is_user_authorized():
+                me2 = await RT.user.get_me()
+                log_bot.info(f"user session loaded: {me2.first_name} (id={me2.id})")
                 if not CONFIG["owner_id"]:
-                    CONFIG["owner_id"] = uid
+                    CONFIG["owner_id"] = me2.id
                     save_config()
-                RT.user = c
+                attach_user_handlers(RT.user)
                 if CONFIG.get("meow_on") and CONFIG.get("meow_chat"):
                     err = RT.meow.start()
                     log_meow.info("meow auto-started" if not err else f"meow not started: {err}")
-            if hcfg(uid)["on"] and hcfg(uid)["chat"]:
-                err = hal_engine(uid).start()
-                log_hal.info(f"[{uid}] halloween auto-started" if not err else f"[{uid}] not started: {err}")
+            else:
+                log_bot.warning("user.session not authorized — QR login needed")
+                try:
+                    await RT.user.disconnect()
+                except Exception:
+                    pass
+                RT.user = None
         except Exception as e:
-            record_error(f"load-session-{uid}", e)
-            try:
-                await c.disconnect()
-            except Exception:
-                pass
-    if not ACCOUNTS:
-        log_bot.info("no saved sessions — login from /start")
+            record_error("load-user-session", e)
+            RT.user = None
+    else:
+        log_bot.info("no user.session — QR login from /start")
 
     RT.watchdog = spawn(_watchdog(), "watchdog")
     log.info("bot ready — open Telegram and send /start")
@@ -3917,20 +3563,22 @@ async def shutdown() -> None:
         RT.engine.stop()
     if RT.meow:
         RT.meow.stop()
-    for e in HAL.values():
-        e.stop()
     slot_stop()
     for task in list(RT.qr_wait_tasks.values()):
         if task and not task.done():
             task.cancel()
-    for c in list(ACCOUNTS.values()) + list(PENDING.values()):
+    if RT.user:
         try:
-            await c.disconnect()
+            await RT.user.disconnect()
         except Exception:
             pass
-    ACCOUNTS.clear()
-    PENDING.clear()
-    RT.user = None
+        RT.user = None
+    if RT.login_client:
+        try:
+            await RT.login_client.disconnect()
+        except Exception:
+            pass
+        RT.login_client = None
     if RT.bot:
         try:
             await RT.bot.disconnect()
@@ -4030,6 +3678,7 @@ def cmd_reset() -> None:
     db_exec("DELETE FROM users")
     db_exec("DELETE FROM groups")
     db_exec("DELETE FROM bets")
+    db_exec("DELETE FROM cap_groups")
     db_exec("VACUUM")
     say("✅ database reset.", "green")
 
@@ -4037,7 +3686,7 @@ def cmd_reset() -> None:
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="selfbot",
-        description="SELF BOT — QR login + MiaoBet auto-bettor + Meow farmer + Halloween",
+        description="SELF BOT — QR login + MiaoBet slots auto-bettor + Meow farmer",
     )
     p.add_argument("--config", action="store_true")
     p.add_argument("--reset", action="store_true")
