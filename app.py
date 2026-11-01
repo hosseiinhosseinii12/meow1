@@ -134,10 +134,14 @@ PUBLIC_API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
 # --- MiaoBet constants (edit if the game bot changes) -----------------------
 MIN_BET = 20_000                       # minimum allowed bet
 GAME_TRIGGER = "میوبت"                 # text that opens the game panel
-BTN_SINGLE = "miobet_player_single"    # panel 1: single player
 # The buttons below are found by callback-data substring OR by their visible text,
 # so the bot works even if the exact callback names differ from my guess.
-SLOT_KEYS = ("slot",)                  # panel 2: slots (data contains this ...)
+# Exact callback IDs of the game bot's buttons (shown by Telegram Desktop's tooltip):
+BTN_SINGLE = "miobet_player_single"    # تک نفره        (miobet_player_single|single)
+SLOT_KEYS = ("miobet_game_wheel",)     # اسلات          (miobet_game_wheel|wheel)
+AMOUNT_KEYS = ("wheel_set_amount",)    # تعیین/تغییر مبلغ ورودی
+START_KEYS = ("wheel_build",)          # شروع بازی
+GAME_BOT_USERNAME = "Meowiebet_bot"    # the ONLY bot this program talks to / detects
 SLOT_TEXTS = ("اسلات",)                # ... or the button text contains this
 AMOUNT_TEXTS = ("تعیین مبلغ", "تغییر مبلغ")   # panel 3/5: set / change the entry amount
 START_TEXTS = ("شروع بازی",)           # panel 5: start the game
@@ -214,7 +218,7 @@ USER_DEFAULTS: Dict[str, Any] = {
     "captcha_solved": 0,    # how many captchas were answered
     "captcha_all": True,    # True = every group except the ones you switched off, False = only switched-on groups
     "game_bot_name": "meowie",   # (lower-case) part of the game bot's display name, used to detect it
-    "game_bot_username": "",     # optional: exact username of the game bot (without @)
+    "game_bot_username": "Meowiebet_bot",   # username of the game bot (without @)
     # Meow farmer
     "meow_on": False,       # loop enabled (re-started automatically on boot)
     "meow_chat": 0,         # group where .activemeow was sent
@@ -1003,17 +1007,21 @@ def find_btn(msg, keys: tuple = (), texts: tuple = ()) -> Optional[bytes]:
     return None
 
 
+def describe_buttons(msg) -> str:
+    out = []
+    rm = getattr(msg, "reply_markup", None)
+    for row in getattr(rm, "rows", None) or []:
+        for b in getattr(row, "buttons", None) or []:
+            out.append(f"{getattr(b, 'text', '?')!r}={getattr(b, 'data', None)!r}")
+    return "; ".join(out) or "(none)"
+
+
 def is_game_bot(user) -> bool:
-    """Is this Telegram user the Meowie bet game bot? (by username, else by display name)"""
+    """True ONLY for the game bot itself (@Meowiebet_bot) — matched by username, never by name."""
     if not getattr(user, "bot", False):
         return False
-    uname = (getattr(user, "username", None) or "").lower()
-    want_un = str(CONFIG.get("game_bot_username") or "").lstrip("@").lower()
-    if want_un and uname == want_un:
-        return True
-    name = clean(f"{getattr(user, 'first_name', '') or ''} {getattr(user, 'last_name', '') or ''}").lower()
-    want = str(CONFIG.get("game_bot_name") or "").strip().lower()
-    return bool(want) and want in name
+    want = (str(CONFIG.get("game_bot_username") or "").lstrip("@") or GAME_BOT_USERNAME).lower()
+    return (getattr(user, "username", None) or "").lower() == want
 
 
 # --- slot result / popup parsing ----------------------------------------------
@@ -1425,7 +1433,7 @@ class BetEngine:
                 except RuntimeError as e:
                     if "logged out" in str(e):
                         raise
-                    log_bet.warning(f"{label}: {e}")
+                    log_bet.warning(f"{label}: {e} — buttons on that message: {describe_buttons(msg)}")
                 except Exception as e:
                     log_bet.warning(f"{label}: click failed: {type(e).__name__}: {e}")
                 left = parse_cooldown(ans)
@@ -1501,7 +1509,7 @@ class BetEngine:
 
         # 3) slots
         self._at(2, "slots")
-        m3 = await self._press_until(m2, btn_pred(texts=AMOUNT_TEXTS), "slots",
+        m3 = await self._press_until(m2, btn_pred(AMOUNT_KEYS, AMOUNT_TEXTS), "slots",
                                      keys=SLOT_KEYS, texts=SLOT_TEXTS, delay=delay)
         if not m3:
             return "fail", "'set entry amount' button never appeared"
@@ -1509,13 +1517,13 @@ class BetEngine:
         # 4) set entry amount -> the bot asks for the amount as a reply
         self._at(3, "entry amount")
         m4 = await self._press_until(m3, text_pred(*PROMPT_HINTS), "entry amount",
-                                     texts=AMOUNT_TEXTS, delay=delay)
+                                     keys=AMOUNT_KEYS, texts=AMOUNT_TEXTS, delay=delay)
         if not m4:
             return "fail", "amount prompt never appeared"
 
         # 5) amount, sent as a reply to the prompt (re-sent if the panel does not come back)
         self._at(4, f"bet {fmt_k(amount)}")
-        f5 = self.expect(btn_pred(texts=START_TEXTS))
+        f5 = self.expect(btn_pred(START_KEYS, START_TEXTS))
         m5 = None
         try:
             for n in range(1, 4):
@@ -1540,7 +1548,8 @@ class BetEngine:
         # 6) start the game (the bot forces 60s between slot games -> popup is read and waited out)
         self._at(5, "starting game")
         m6 = await self._press_until(m5, lambda m: m.date >= t0 and mine(m), "start game",
-                                     texts=START_TEXTS, delay=delay, max_ticks=3, accept_popup=True)
+                                     keys=START_KEYS, texts=START_TEXTS, delay=delay,
+                                     max_ticks=3, accept_popup=True)
         if m6 is None:
             m6 = m5        # the start message may simply be the edited panel
         ids.add(m6.id)
@@ -2103,8 +2112,9 @@ async def _on_captcha(event) -> None:
     Answer the game bot's math captcha instantly.
       * a group switched OFF in the Captcha panel is never answered
       * a group switched ON is always answered
-      * a group the bot has never been seen in follows "All groups" (captcha_all)
-      * the first captcha from the game bot in an unknown group registers that group (ON)
+      * only captchas sent by @Meowiebet_bot are answered
+      * the first captcha it sends in a new group registers that group (ON), unless
+        "Selected only" is chosen
     """
     if not CONFIG.get("captcha_on", True) or not event.is_group:
         return
@@ -2115,16 +2125,13 @@ async def _on_captcha(event) -> None:
     if key in A().captcha_done:
         return
     sender = await event.get_sender()
-    if not getattr(sender, "bot", False):
-        return
-    active = int(CONFIG.get("bet_chat") or 0)
-    is_active = bool(active) and event.chat_id == active
-    eng = RT.engine
-    if is_active and eng and eng.game_bot_id and sender.id != eng.game_bot_id:
+    if not is_game_bot(sender):          # only @Meowiebet_bot — no other bot, no other group
         return
 
     state = db_cap_state(event.chat_id)
-    if state is None and is_game_bot(sender):
+    if state is None:                    # first captcha of the game bot in a new group
+        if not CONFIG.get("captcha_all", True):
+            return                       # "Selected only": new groups must be added by hand / Detect
         try:
             chat = await event.get_chat()
             title = getattr(chat, "title", None) or str(event.chat_id)
@@ -2133,10 +2140,9 @@ async def _on_captcha(event) -> None:
             log_bet.info(f"captcha: game bot detected in {title} ({event.chat_id})")
         except Exception as e:
             log_bet.warning(f"captcha: could not register group: {type(e).__name__}: {e}")
+            return
     if state == 0:
-        return                                     # switched off by the user
-    if not (is_active or state == 1 or CONFIG.get("captcha_all", True)):
-        return
+        return                           # switched off by the user
 
     A().captcha_done.add(key)
     if len(A().captcha_done) > 2000:
@@ -2195,9 +2201,7 @@ async def _on_game_msg(event) -> None:
         sender = await event.get_sender()
     except Exception:
         return
-    if not getattr(sender, "bot", False):
-        return
-    if eng.game_bot_id and sender.id != eng.game_bot_id:
+    if not is_game_bot(sender):          # only @Meowiebet_bot
         return
     eng.last_bot_text = clean(event.raw_text)[:300]
     eng.feed(event.message)
@@ -2624,7 +2628,8 @@ def captcha_view(note: str = "") -> Tuple[str, list]:
     text = (
         hdr("🧮", "Captcha solver", "answers the game bot instantly") + "\n\n"
         f"⚙️ **Status**  {onoff(on)}\n"
-        f"🌐 **Unknown groups**  {'answered too' if allg else 'ignored'}\n"
+        f"🤖 **Bot**  @{GAME_BOT_USERNAME}\n"
+        f"➕ **New groups with the bot**  {'added automatically' if allg else 'ignored (Selected only)'}\n"
         f"✅ **Solved**  {int(CONFIG.get('captcha_solved') or 0)}\n"
         f"{LINE}\n"
         f"👥 **Game groups**  {len(groups)} found · {n_on} on\n"
@@ -2635,7 +2640,7 @@ def captcha_view(note: str = "") -> Tuple[str, list]:
     rows = [
         [sbtn(f"🧮 Captcha: {'ON' if on else 'OFF'}", b"bet:captcha", "success" if on else "danger")],
         [sbtn("🔍 Detect groups", b"bet:cap:scan", "primary"),
-         sbtn("🌐 All groups" if allg else "☑️ Selected only", b"bet:captchascope", "primary")],
+         sbtn("➕ Auto-add new" if allg else "☑️ Selected only", b"bet:captchascope", "primary")],
     ]
     for g in groups[:24]:
         title = (g["title"] or str(g["chat_id"]))[:28]
