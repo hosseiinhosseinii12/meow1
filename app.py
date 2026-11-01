@@ -1007,6 +1007,10 @@ def find_btn(msg, keys: tuple = (), texts: tuple = ()) -> Optional[bytes]:
     return None
 
 
+LEARNED_BOT_IDS: set = set()     # ids of bots that sent miobet_* / wheel_* buttons
+_IGNORED_LOGGED: set = set()
+
+
 def describe_buttons(msg) -> str:
     out = []
     rm = getattr(msg, "reply_markup", None)
@@ -1020,6 +1024,8 @@ def is_game_bot(user) -> bool:
     """True ONLY for the game bot itself (@Meowiebet_bot) — matched by username, never by name."""
     if not getattr(user, "bot", False):
         return False
+    if getattr(user, "id", None) in LEARNED_BOT_IDS:      # seen sending the game's own buttons
+        return True
     want = (str(CONFIG.get("game_bot_username") or "").lstrip("@") or GAME_BOT_USERNAME).lower()
     return (getattr(user, "username", None) or "").lower() == want
 
@@ -1472,7 +1478,8 @@ class BetEngine:
         def mine(m) -> bool:
             """Ignore the bot's answers to other players in the same group."""
             rt = getattr(m, "reply_to_msg_id", None)
-            return rt is None or not ids or rt in ids
+            return (rt is None or not ids or rt in ids
+                    or bool(getattr(m, "_reply_out", False)))
 
         def btn_pred(keys: tuple = (), texts: tuple = ()):
             return lambda m: m.date >= t0 and mine(m) and find_btn(m, keys, texts) is not None
@@ -2201,10 +2208,33 @@ async def _on_game_msg(event) -> None:
         sender = await event.get_sender()
     except Exception:
         return
-    if not is_game_bot(sender):          # only @Meowiebet_bot
+    if not getattr(sender, "bot", False):
         return
+    msg = event.message
+    # the game bot is recognised by its username OR by the game's own button IDs
+    if not is_game_bot(sender):
+        if find_btn(msg, ("miobet_", "wheel_")) is None:
+            key = getattr(sender, "username", None) or sender.id
+            if key not in _IGNORED_LOGGED:
+                _IGNORED_LOGGED.add(key)
+                log_bet.info(f"ignoring bot @{getattr(sender, 'username', None)} (id {sender.id}) — "
+                             f"not the game bot @{GAME_BOT_USERNAME}")
+            return
+        LEARNED_BOT_IDS.add(sender.id)
+        log_bet.warning(f"game bot is @{getattr(sender, 'username', None)} (id {sender.id}) — "
+                        f"not @{GAME_BOT_USERNAME}; accepted because of its buttons")
+    # is this an answer to something WE sent?  (other players use the same bot in the group)
+    try:
+        if msg.is_reply:
+            rep = await msg.get_reply_message()
+            msg._reply_out = bool(rep is not None and rep.out)
+    except Exception:
+        pass
     eng.last_bot_text = clean(event.raw_text)[:300]
-    eng.feed(event.message)
+    log_bet.info(f"bot msg id={msg.id} reply_to={getattr(msg, 'reply_to_msg_id', None)} "
+                 f"mine={getattr(msg, '_reply_out', None)} buttons=[{describe_buttons(msg)}] "
+                 f"text={clean(event.raw_text)[:60]!r}")
+    eng.feed(msg)
 
 
 def attach_user_handlers(client: TelegramClient) -> None:
